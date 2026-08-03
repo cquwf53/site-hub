@@ -118,13 +118,9 @@ function Get-TaskLauncherRecords {
     })
 }
 
-function Test-ControlPlaneOwner {
-    param(
-        [Parameter(Mandatory = $true)]$Record,
-        [Parameter(Mandatory = $true)][string]$ExpectedPython
-    )
+function Test-ControlPlaneCommand {
+    param([Parameter(Mandatory = $true)]$Record)
 
-    if (-not (Test-SiteHubPathEqual ([string]$Record.ExecutablePath) $ExpectedPython)) { return $false }
     $commandLine = [string]$Record.CommandLine
     if ([string]::IsNullOrWhiteSpace($commandLine)) { return $false }
     return [regex]::IsMatch(
@@ -132,6 +128,40 @@ function Test-ControlPlaneOwner {
         '(?:^|\s)-m\s+(?:"site_hub\.main"|site_hub\.main)(?:\s|$)',
         [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
     )
+}
+
+function Test-ControlPlaneOwner {
+    param(
+        [Parameter(Mandatory = $true)]$Record,
+        [Parameter(Mandatory = $true)][string]$ExpectedPython,
+        [Parameter(Mandatory = $true)][object[]]$Snapshot
+    )
+
+    if (-not (Test-ControlPlaneCommand $Record)) { return $false }
+    if (Test-SiteHubPathEqual ([string]$Record.ExecutablePath) $ExpectedPython) {
+        return $true
+    }
+
+    # Python 3.13's Windows venv launcher can create a second process whose
+    # WMI ExecutablePath is the base interpreter even though argv[0] and the
+    # direct parent are the project venv. Accept only that exact, verified
+    # parent relationship; an unrelated base-Python listener remains blocked.
+    $parentId = [int]$Record.ParentProcessId
+    if ($parentId -le 0) { return $false }
+    $parents = @($Snapshot | Where-Object { [int]$_.ProcessId -eq $parentId })
+    if ($parents.Count -ne 1) { return $false }
+    $parent = $parents[0]
+    if (-not (Test-SiteHubPathEqual ([string]$parent.ExecutablePath) $ExpectedPython)) {
+        return $false
+    }
+    if (-not (Test-ControlPlaneCommand $parent)) { return $false }
+
+    $ownerStamp = Get-ProcessCreationStamp $Record
+    $parentStamp = Get-ProcessCreationStamp $parent
+    if ($ownerStamp -and $parentStamp -and [int64]$ownerStamp -lt [int64]$parentStamp) {
+        return $false
+    }
+    return $true
 }
 
 function Stop-VerifiedProcess {
@@ -192,14 +222,14 @@ if ($listeners.Count -gt 0) {
     }
     $ownerId = [int]$ownerIds[0]
     $owners = @($snapshot | Where-Object { [int]$_.ProcessId -eq $ownerId })
-    if ($owners.Count -ne 1 -or -not (Test-ControlPlaneOwner $owners[0] $venvPython)) {
+    if ($owners.Count -ne 1 -or -not (Test-ControlPlaneOwner $owners[0] $venvPython $snapshot)) {
         $ownerPath = if ($owners.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$owners[0].ExecutablePath)) {
             [string]$owners[0].ExecutablePath
         } else { '<unavailable>' }
-        throw "Port 8686 owner PID $ownerId is not this project's .venv SiteHub control plane (executable: $ownerPath). Nothing was stopped."
+        throw "Port 8686 owner PID $ownerId is not this project's verified .venv SiteHub control-plane chain (executable: $ownerPath). Nothing was stopped."
     }
     $ownerRecord = $owners[0]
-    Write-Step "Verified port 8686 owner PID $ownerId from this project's .venv."
+    Write-Step "Verified port 8686 owner PID $ownerId from this project's .venv process chain."
 }
 
 $rootRecords = New-Object System.Collections.Generic.List[object]
