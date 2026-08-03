@@ -65,7 +65,7 @@ function findChromeExecutable() {
   return candidates.find(candidate => fs.existsSync(candidate)) || null;
 }
 
-async function isAuthenticatedPage(site, page) {
+export async function isAuthenticatedPage(site, page) {
   let hostname = '';
   try {
     hostname = new URL(site.url).hostname;
@@ -127,10 +127,46 @@ async function isAuthenticatedPage(site, page) {
     return /欢迎回来|退出/.test(infoText);
   }
 
-  return isAuthenticatedUrl(site.url, page.url());
+  if (hostname === '52pojie.cn' || hostname === 'www.52pojie.cn') {
+    const hasLogout = await page.locator('a[href*="action=logout"]').count() > 0;
+    const hasUserMenu = await page.locator(
+      '#um .avt, #um .vwmy, #um a[href*="space-uid"]',
+    ).count() > 0;
+    const hasLoginForm = await page.locator(
+      'form[action*="logging"], input[name="username"]',
+    ).count() > 0;
+    return (hasLogout || hasUserMenu) && !hasLoginForm;
+  }
+
+  if (hostname === 'v2ex.com' || hostname === 'www.v2ex.com') {
+    let currentHostname = '';
+    try {
+      currentHostname = new URL(page.url()).hostname;
+    } catch {
+      return false;
+    }
+    if (currentHostname !== 'v2ex.com' && currentHostname !== 'www.v2ex.com') {
+      return false;
+    }
+
+    // V2EX's authenticated top navigation exposes all three account actions.
+    // Topic/member links elsewhere on the public homepage are deliberately not
+    // accepted because they are also visible to signed-out visitors.
+    const hasMemberMenu = await page.locator('#Top a[href^="/member/"]').count() > 0;
+    const hasSettings = await page.locator('#Top a[href="/settings"]').count() > 0;
+    const hasSignOut = await page.locator('#Top a[href^="/signout"]').count() > 0;
+    const hasGuestActions = await page.locator(
+      '#Top a[href="/signin"], #Top a[href="/signup"]',
+    ).count() > 0;
+    return hasMemberMenu && hasSettings && hasSignOut && !hasGuestActions;
+  }
+
+  // A same-origin landing page is not proof of authentication. Unknown generic
+  // sites need a dedicated, positive read-only contract before they can pass.
+  return false;
 }
 
-class LoginSessionManager {
+export class LoginSessionManager {
   constructor() {
     this.sessions = new Map();
     fs.mkdirSync(PROFILES_DIR, { recursive: true });
@@ -144,12 +180,13 @@ class LoginSessionManager {
     }
   }
 
-  writeMarker(site, currentUrl) {
+  writeMarker(site, currentUrl, { verified = false } = {}) {
     const marker = {
       siteId: site.id,
       siteName: site.name,
       authenticatedAt: new Date().toISOString(),
       lastUrl: sanitizeUrl(currentUrl),
+      ...(verified ? { verifiedBy: 'sitehub-profile-verifier', markerVersion: 1 } : {}),
     };
 
     fs.mkdirSync(getProfileDir(site.id), { recursive: true });
@@ -177,7 +214,7 @@ class LoginSessionManager {
     const marker = this.readMarker(site.id);
     if (marker) {
       return {
-        state: 'ready',
+        state: marker.verifiedBy === 'sitehub-profile-verifier' ? 'ready' : 'unverified',
         startedAt: null,
         authenticatedAt: marker.authenticatedAt || null,
         currentUrl: marker.lastUrl || '',
@@ -196,7 +233,7 @@ class LoginSessionManager {
     };
   }
 
-  async startSystemChrome(site) {
+  async startSystemChrome(site, onComplete = null) {
     const siteId = String(site.id);
     const existing = this.sessions.get(siteId);
     if (existing) return this.getStatus(site);
@@ -248,8 +285,16 @@ class LoginSessionManager {
       browserProcess.once('exit', () => {
         this.sessions.delete(siteId);
         const timer = setTimeout(() => {
-          void this.verify(site).catch(error => {
-            console.error(`[登录状态] ${site.name} 自动验证失败：${error.message}`);
+          void this.verify(site).then(result => {
+            if (typeof onComplete === 'function') onComplete(result);
+          }).catch(error => {
+            const result = {
+              state: 'error', startedAt: session.startedAt, authenticatedAt: null,
+              currentUrl: session.currentUrl, method: 'verification',
+              error: redactText(error?.message || error, 1000),
+            };
+            if (typeof onComplete === 'function') onComplete(result);
+            console.error(`[登录状态] ${site.name} 自动验证失败：${result.error}`);
           });
         }, 1500);
         timer.unref?.();
@@ -272,12 +317,19 @@ class LoginSessionManager {
   async verify(site) {
     const siteId = String(site.id);
     const existing = this.sessions.get(siteId);
-    if (existing?.browserProcess && existing.browserProcess.exitCode === null) {
-      throw new Error('请先关闭该站点的普通 Chrome 登录窗口');
+    if (existing) {
+      return {
+        state: 'busy',
+        startedAt: existing.startedAt || null,
+        authenticatedAt: existing.authenticatedAt || null,
+        currentUrl: existing.currentUrl || '',
+        method: 'verification',
+        error: '该 Profile 正在被浏览器使用，请关闭对应窗口后重试',
+      };
     }
 
     const session = {
-      state: 'starting',
+      state: 'verifying',
       startedAt: new Date().toISOString(),
       authenticatedAt: null,
       currentUrl: '',
@@ -294,6 +346,8 @@ class LoginSessionManager {
         hostname === 'nodeseek.com'
         || hostname === 'www.nodeseek.com'
         || hostname === 'pt.btschool.club'
+        || hostname === '52pojie.cn'
+        || hostname === 'www.52pojie.cn'
       ) {
         session.browserSession = await launchSystemChromeCdp(getProfileDir(siteId));
         session.context = session.browserSession.context;
@@ -312,10 +366,17 @@ class LoginSessionManager {
 
       if (!await isAuthenticatedPage(site, page)) {
         this.clearMarker(siteId);
-        throw new Error('登录状态验证失败，请重新登录');
+        return {
+          state: 'expired',
+          startedAt: session.startedAt,
+          authenticatedAt: null,
+          currentUrl: session.currentUrl,
+          method: 'verification',
+          error: '登录状态已过期，请重新登录',
+        };
       }
 
-      const marker = this.writeMarker(site, page.url());
+      const marker = this.writeMarker(site, page.url(), { verified: true });
       return {
         state: 'ready',
         startedAt: session.startedAt,
@@ -323,6 +384,18 @@ class LoginSessionManager {
         currentUrl: marker.lastUrl,
         method: 'verification',
         error: null,
+      };
+    } catch (error) {
+      const message = redactText(error?.message || error, 1000);
+      const busy = /user data directory is already in use|ProcessSingleton|profile.*in use/i
+        .test(message);
+      return {
+        state: busy ? 'busy' : 'error',
+        startedAt: session.startedAt,
+        authenticatedAt: null,
+        currentUrl: session.currentUrl,
+        method: 'verification',
+        error: busy ? '该 Profile 正在被浏览器使用，请关闭对应窗口后重试' : message,
       };
     } finally {
       if (session.browserSession) {

@@ -13,7 +13,8 @@ from uuid import UUID, uuid4
 
 from site_hub.db import Database, SiteHubRepository
 from site_hub.notifications import NotificationOutboxStore
-from site_hub.services.ports import StaleJobWrite
+from site_hub.scrapers.network import sanitize_log_value
+from site_hub.services.ports import AccountNotReady, StaleJobWrite
 
 
 T = TypeVar("T")
@@ -96,11 +97,53 @@ class DataLayerStore:
 
     def _ensure_defaults(self) -> None:
         with self.database.transaction(immediate=True) as conn:
+            now = _iso(datetime.now(UTC))
             conn.execute(
                 """INSERT OR IGNORE INTO folders(id,parent_id,name,sort_order,created_at,updated_at)
                    VALUES(?,NULL,'Sites',0,?,?)""",
-                (self.ROOT_FOLDER_ID, _iso(datetime.now(UTC)), _iso(datetime.now(UTC))),
+                (self.ROOT_FOLDER_ID, now, now),
             )
+            interrupted_accounts = [
+                str(row[0]) for row in conn.execute(
+                    """SELECT DISTINCT bp.account_id
+                       FROM browser_profiles bp
+                       JOIN capability_instances c
+                         ON c.account_id=bp.account_id AND c.code='checkin'
+                       WHERE bp.state='busy'
+                         AND lower(coalesce(c.adapter,'')) NOT IN ('api','cookie')"""
+                )
+            ]
+            conn.execute(
+                """UPDATE browser_profiles
+                   SET state='unverified',verification_error='Previous verification was interrupted',
+                       updated_at=?
+                   WHERE state='busy'""",
+                (now,),
+            )
+            for account_id in interrupted_accounts:
+                conn.execute(
+                    """UPDATE site_accounts
+                       SET enabled=0,auth_state='unverified',
+                           verification_error='Previous verification was interrupted',updated_at=?
+                       WHERE id=? AND auth_state!='disabled'""",
+                    (now, account_id),
+                )
+                conn.execute(
+                    """UPDATE capability_instances SET enabled=0,updated_at=?
+                       WHERE account_id=? AND code='checkin'""",
+                    (now, account_id),
+                )
+                conn.execute(
+                    """UPDATE schedules SET enabled=0,updated_at=?
+                       WHERE capability_instance_id IN (
+                           SELECT id FROM capability_instances
+                           WHERE account_id=? AND code='checkin'
+                       )""",
+                    (now, account_id),
+                )
+                self._cancel_queued_checkins_locked(
+                    conn, now, account_id=account_id,
+                )
         defaults = {
             "scheduler.timezone": "Asia/Shanghai",
             "scheduler.checkin_window_start": "08:00:00",
@@ -598,8 +641,8 @@ class DataLayerStore:
             "schedule_override": override, "profile_key": row.get("profile_path") or row["id"],
             "config": config,
             "configured": bool(config or secret_fields), "configured_secret_fields": secret_fields,
-            "login_state": "not_configured" if row.get("auth_state") == "unverified" and not (config or secret_fields) else row.get("auth_state") or "not_configured",
-            "auth_state": "not_configured" if row.get("auth_state") == "unverified" and not (config or secret_fields) else row.get("auth_state") or "not_configured",
+            "login_state": row.get("auth_state") or "unverified",
+            "auth_state": row.get("auth_state") or "unverified",
             "created_at": row["created_at"], "updated_at": row["updated_at"],
             "profile": {
                 "relative_path": row.get("profile_path") or row["id"],
@@ -624,7 +667,11 @@ class DataLayerStore:
         capability_id = str(uuid4())
         profile_id = str(uuid4())
         schedule_id = str(uuid4())
-        enabled = bool(payload.get("enabled", True))
+        adapter = str(payload.get("adapter", "playwright"))
+        # Browser-backed accounts cannot be safely scheduled until a live
+        # Profile verification succeeds. API/cookie adapters do not depend on
+        # the browser Profile and retain their explicit enabled choice.
+        enabled = bool(payload.get("enabled", False)) and adapter.lower() in {"api", "cookie"}
         clean, secrets = self._split_secrets(payload.get("config") or {})
         clean["_secret_fields"] = sorted(secrets)
         override = payload.get("schedule_override")
@@ -646,7 +693,7 @@ class DataLayerStore:
                    ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (
                     capability_id, site_id, self.CHECKIN_CODE, account_id,
-                    str(payload.get("adapter", "playwright")), 1, _dumps(clean),
+                    adapter, 1, _dumps(clean),
                     int(enabled), now, now,
                 ),
             )
@@ -677,7 +724,7 @@ class DataLayerStore:
     def _update_account_sync(self, account_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         with self.database.transaction(immediate=True) as conn:
             account = conn.execute(
-                "SELECT id FROM site_accounts WHERE id=? AND auth_state!='disabled'", (account_id,)
+                "SELECT id,enabled,auth_state FROM site_accounts WHERE id=? AND auth_state!='disabled'", (account_id,)
             ).fetchone()
             if not account:
                 return None
@@ -689,6 +736,22 @@ class DataLayerStore:
             ).fetchone() if capability else None
             if not capability:
                 raise RuntimeError("account has no check-in capability")
+            next_adapter = str(payload.get("adapter", capability["adapter"]) or "").lower()
+            currently_enabled = (
+                bool(account["enabled"])
+                and bool(capability["enabled"])
+                and bool(schedule and schedule["enabled"])
+            )
+            next_enabled = bool(payload["enabled"]) if "enabled" in payload else currently_enabled
+            activation_requested = payload.get("enabled") is True or (
+                "adapter" in payload and next_enabled
+            )
+            if (
+                activation_requested
+                and next_adapter not in {"api", "cookie"}
+                and account["auth_state"] != "ready"
+            ):
+                raise AccountNotReady("Verify the browser Profile before enabling this account")
             now = _iso(datetime.now(UTC))
             account_fields: list[str] = []
             account_values: list[Any] = []
@@ -762,6 +825,89 @@ class DataLayerStore:
             self.repository.update_site_account, _uuid(account_id), auth_state=normalized,
             verification_error=error,
         )
+
+    async def set_account_profile_verification(
+        self, account_id: UUID, state: str, error: str | None = None,
+        verified_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically persist a read-only Profile verification result.
+
+        ``busy`` is deliberately Profile-only: transient worker activity must
+        not be squeezed into the terminal ``site_accounts.auth_state`` enum.
+        """
+        return await self._call(
+            self._set_account_profile_verification_sync,
+            _uuid(account_id), state, error, verified_at,
+        )
+
+    def _set_account_profile_verification_sync(
+        self, account_id: str, state: str, error: str | None,
+        verified_at: str | None,
+    ) -> dict[str, Any] | None:
+        normalized = str(state or "error").lower()
+        if normalized not in {"ready", "expired", "error", "busy", "unverified"}:
+            normalized = "error"
+        safe_error = sanitize_log_value(error, max_length=500) if error else None
+        now = _iso(datetime.now(UTC))
+        success_at = _iso(verified_at) if normalized == "ready" and verified_at else now
+
+        with self.database.transaction(immediate=True) as conn:
+            account = conn.execute(
+                "SELECT auth_state FROM site_accounts WHERE id=? AND auth_state!='disabled'",
+                (account_id,),
+            ).fetchone()
+            if not account:
+                return None
+
+            if normalized == "busy":
+                conn.execute(
+                    """UPDATE browser_profiles
+                       SET state='busy',verification_error=?,updated_at=?
+                       WHERE account_id=? AND state!='archived'""",
+                    (safe_error, now, account_id),
+                )
+            else:
+                account_state = normalized if normalized in {"ready", "expired", "error"} else "unverified"
+                profile_state = "ready" if normalized == "ready" else (
+                    "unverified" if normalized == "unverified" else "error"
+                )
+                if normalized == "ready":
+                    conn.execute(
+                        """UPDATE site_accounts
+                           SET auth_state='ready',last_verified_at=?,verification_error=NULL,updated_at=?
+                           WHERE id=? AND auth_state!='disabled'""",
+                        (success_at, now, account_id),
+                    )
+                    conn.execute(
+                        """UPDATE browser_profiles
+                           SET state='ready',last_verified_at=?,verification_error=NULL,updated_at=?
+                           WHERE account_id=? AND state!='archived'""",
+                        (success_at, now, account_id),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE site_accounts
+                           SET enabled=0,auth_state=?,verification_error=?,updated_at=?
+                           WHERE id=? AND auth_state!='disabled'""",
+                        (account_state, safe_error, now, account_id),
+                    )
+                    conn.execute(
+                        """UPDATE browser_profiles
+                           SET state=?,verification_error=?,updated_at=?
+                           WHERE account_id=? AND state!='archived'""",
+                        (profile_state, safe_error, now, account_id),
+                    )
+                    conn.execute(
+                        "UPDATE capability_instances SET enabled=0,updated_at=? WHERE account_id=? AND code='checkin'",
+                        (now, account_id),
+                    )
+                    conn.execute(
+                        """UPDATE schedules SET enabled=0,updated_at=? WHERE capability_instance_id IN
+                           (SELECT id FROM capability_instances WHERE account_id=? AND code='checkin')""",
+                        (now, account_id),
+                    )
+                    self._cancel_queued_checkins_locked(conn, now, account_id=account_id)
+        return self._account_row(account_id)
 
     # -- Product monitoring ------------------------------------------
     def _ensure_product_capability_sync(

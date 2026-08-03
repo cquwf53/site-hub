@@ -280,6 +280,7 @@ class SensitiveUrl:
 
 def split_sensitive_url(
     url: str, service: SecretService, purpose: str, *,
+    secret_id: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> SensitiveUrl:
     """Remove and encrypt an exact URL query/fragment suffix."""
@@ -294,8 +295,10 @@ def split_sensitive_url(
     query_keys = tuple(dict.fromkeys(name for name, _ in parse_qsl(
         query, keep_blank_values=True, strict_parsing=False
     )))
-    secret_id = service.store(purpose, suffix, conn=conn)
-    return SensitiveUrl(base, secret_id, query_keys)
+    stored_secret_id = service.store(
+        purpose, suffix, secret_id=secret_id, conn=conn,
+    )
+    return SensitiveUrl(base, stored_secret_id, query_keys)
 
 
 def restore_sensitive_url(url_base: str, secret_id: str | None, service: SecretService) -> str:

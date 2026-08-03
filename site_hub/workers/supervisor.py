@@ -11,6 +11,7 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from site_hub.jobs.service import JobService, StaleLease
@@ -20,6 +21,23 @@ from site_hub.workers.jsonrpc import JsonRpcError, JsonRpcPeer
 
 
 logger=logging.getLogger(__name__)
+
+
+def _safe_session_url(value: object) -> str:
+    """Accept only a query/fragment-free HTTP(S) URL from the untrusted worker."""
+    try:
+        parsed=urlsplit(str(value or ""))
+        if parsed.scheme not in {"http","https"} or not parsed.hostname:
+            return ""
+        host=f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        port=parsed.port
+        if port is not None and not (
+            (parsed.scheme=="http" and port==80) or (parsed.scheme=="https" and port==443)
+        ):
+            host=f"{host}:{port}"
+        return urlunsplit((parsed.scheme,host,parsed.path or "/","",""))
+    except (TypeError,ValueError):
+        return ""
 
 
 if sys.platform == "win32":
@@ -204,6 +222,7 @@ class NodeWorkerSupervisor:
             restart_count=self.restart_count,last_heartbeat_at=self.last_heartbeat_at,last_error=self.last_error)
 
     async def open_session(self,account_id:UUID)->dict[str,Any]: return await self._rpc("session.open",await self._session_params(account_id),60)
+    async def verify_session(self,account_id:UUID)->dict[str,Any]: return await self._rpc("session.verify",await self._session_params(account_id),60)
     async def session_status(self,account_id:UUID)->dict[str,Any]: return await self._rpc("session.status",await self._session_params(account_id),10)
     async def close_session(self,account_id:UUID)->dict[str,Any]: return await self._rpc("session.close",await self._session_params(account_id),20)
     async def cancel_job(self,job_id:UUID)->None:
@@ -335,12 +354,29 @@ class NodeWorkerSupervisor:
         return {"accepted":True}
     async def _on_session_event(self,params:dict[str,Any])->dict[str,Any]:
         account_id=params.get("accountId")
-        if account_id and hasattr(self.jobs.store,"set_account_auth_state"):
+        raw_state=str(params.get("state") or "error").lower()
+        state=("busy" if raw_state in {"starting","running","opened","opening","awaiting_user","verifying","busy"}
+               else raw_state if raw_state in {"ready","expired","error","unverified"} else "error")
+        error=sanitize_log_value(
+            params.get("error") or params.get("message") or "",max_length=500,
+        ) or None
+        if account_id and hasattr(self.jobs.store,"set_account_profile_verification"):
             with suppress(Exception):
-                await self.jobs.store.set_account_auth_state(
-                    UUID(str(account_id)),str(params.get("state") or "error"),params.get("message")
+                await self.jobs.store.set_account_profile_verification(
+                    UUID(str(account_id)),state,error,params.get("authenticatedAt")
                 )
-        await self.jobs.events.publish("session",params); return {"accepted":True}
+        elif account_id and hasattr(self.jobs.store,"set_account_auth_state") and state != "busy":
+            with suppress(Exception):
+                await self.jobs.store.set_account_auth_state(UUID(str(account_id)),state,error)
+        event={
+            "accountId":str(account_id) if account_id else None,
+            "action":str(params.get("action") or "status")[:32],
+            "state":raw_state,
+            "authenticatedAt":params.get("authenticatedAt"),
+            "currentUrl":_safe_session_url(params.get("currentUrl")),
+            "error":error,
+        }
+        await self.jobs.events.publish("session",event); return {"accepted":True}
 
     async def _dispatch_loop(self)->None:
         assert self.instance_id

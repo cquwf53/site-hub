@@ -55,7 +55,9 @@ export const useTaskStore = defineStore('tasks', () => {
     if (!item) return
     if (payload.status) item.status = payload.status as TaskStatus
     if (typeof payload.progress === 'number') item.progress = payload.progress
-    if (payload.message !== undefined) item.message = payload.message || ''
+    if (payload.message !== undefined || payload.error_message !== undefined) {
+      item.message = payload.message || payload.error_message || ''
+    }
     item.updatedAt = payload.updated_at || new Date().toISOString()
   }
 

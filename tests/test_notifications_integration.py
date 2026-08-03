@@ -223,7 +223,8 @@ async def test_checkin_and_product_failures_notify_only_at_final_terminal_attemp
     jobs = JobService(store, EventBroker(), lease_seconds=1)
     try:
         account = await store.create_account(site_id, {
-            "name": "Primary", "adapter": "worker", "enabled": True,
+            # Notification retry behavior is independent of browser login.
+            "name": "Primary", "adapter": "api", "enabled": True,
         })
         checkin, _ = await jobs.enqueue_checkin(UUID(str(account["id"])))
         for attempt in range(1, 4):
@@ -263,7 +264,8 @@ async def test_expired_final_checkin_lease_creates_effect_unknown_notification(t
     jobs = JobService(store, EventBroker(), lease_seconds=1)
     try:
         account = await store.create_account(site_id, {
-            "name": "Lease account", "adapter": "worker", "enabled": True,
+            # Lease recovery is tested with an already-runnable direct adapter.
+            "name": "Lease account", "adapter": "api", "enabled": True,
         })
         task, _ = await jobs.enqueue_checkin(UUID(str(account["id"])))
         for attempt in range(1, 4):

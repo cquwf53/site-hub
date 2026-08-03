@@ -20,18 +20,20 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from site_hub.db import Database  # noqa: E402
 from site_hub.services.legacy_import import (  # noqa: E402
+    ArtifactCopier,
     FROZEN_SNAPSHOT_COUNTS,
     LegacyImporter,
     ProfileCopier,
+    profile_inventory_summary,
 )
 from site_hub.services.secrets import SecretService  # noqa: E402
 
 
 RECEIPT_KIND = "sitehub-cutover-preflight"
-RECEIPT_VERSION = 1
+RECEIPT_VERSION = 2
 RECEIPT_MAX_LIFETIME = timedelta(minutes=60)
 RECEIPT_FUTURE_SKEW = timedelta(minutes=5)
-RECEIPT_BINDING_SETTING = "migration.cutover_receipt.v1"
+RECEIPT_BINDING_SETTING = "migration.cutover_receipt.v2"
 _RECEIPT_MAX_BYTES = 64 * 1024
 
 
@@ -93,7 +95,11 @@ def _validate_receipt_document(
     target_db: Path,
     profile_source: Path | None,
     profile_target: Path | None,
+    artifact_source: Path | None,
+    artifact_target: Path | None,
     check_time: bool,
+    check_profile_manifest: bool = True,
+    check_artifact_manifest: bool = True,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     if not isinstance(receipt, dict):
@@ -150,6 +156,110 @@ def _validate_receipt_document(
     )
     if profile_target is not None and _path_key(receipt_profile_target) != _path_key(profile_target):
         raise SystemExit("preflight receipt Profile target does not match --profile-target")
+
+    profile_manifest = receipt.get("profile_manifest")
+    if not isinstance(profile_manifest, dict):
+        raise SystemExit("preflight receipt has no valid profile_manifest")
+    profile_manifest_sha256 = str(profile_manifest.get("sha256") or "").strip().lower()
+    if len(profile_manifest_sha256) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in profile_manifest_sha256
+    ):
+        raise SystemExit("preflight receipt has no valid Profile manifest SHA-256")
+    profile_counts: dict[str, int] = {}
+    for field in ("profiles", "files", "bytes"):
+        value = profile_manifest.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise SystemExit("preflight receipt has no valid Profile manifest counts")
+        profile_counts[field] = value
+    if check_profile_manifest:
+        try:
+            current_profiles = profile_inventory_summary(
+                ProfileCopier(
+                    receipt_profile_source, receipt_profile_target,
+                ).inventory()
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise SystemExit(
+                f"unable to verify legacy Profile source: {exc}"
+            ) from exc
+        if (
+            not hmac.compare_digest(
+                str(current_profiles["sha256"]), profile_manifest_sha256,
+            )
+            or current_profiles["profiles"] != profile_counts["profiles"]
+            or current_profiles["files"] != profile_counts["files"]
+            or current_profiles["bytes"] != profile_counts["bytes"]
+        ):
+            raise SystemExit(
+                "legacy Profile source manifest changed after preflight; "
+                "generate a new receipt"
+            )
+
+    receipt_artifact_source = _receipt_path(
+        receipt.get("artifact_source"), "artifact_source"
+    )
+    if (
+        artifact_source is not None
+        and _path_key(receipt_artifact_source) != _path_key(artifact_source)
+    ):
+        raise SystemExit(
+            "preflight receipt artifact source does not match --artifact-source"
+        )
+    if not receipt_artifact_source.is_dir():
+        raise SystemExit(
+            f"preflight receipt artifact source is missing: {receipt_artifact_source}"
+        )
+
+    receipt_artifact_target = _receipt_path(
+        receipt.get("artifact_target"), "artifact_target"
+    )
+    if (
+        artifact_target is not None
+        and _path_key(receipt_artifact_target) != _path_key(artifact_target)
+    ):
+        raise SystemExit(
+            "preflight receipt artifact target does not match --artifact-target"
+        )
+
+    artifact_manifest = receipt.get("artifact_manifest")
+    if not isinstance(artifact_manifest, dict):
+        raise SystemExit("preflight receipt has no valid artifact_manifest")
+    manifest_sha256 = str(artifact_manifest.get("sha256") or "").strip().lower()
+    if len(manifest_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in manifest_sha256
+    ):
+        raise SystemExit("preflight receipt has no valid artifact manifest SHA-256")
+    files = artifact_manifest.get("files")
+    size = artifact_manifest.get("bytes")
+    if (
+        isinstance(files, bool)
+        or not isinstance(files, int)
+        or files < 0
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size < 0
+    ):
+        raise SystemExit("preflight receipt has no valid artifact manifest counts")
+
+    if check_artifact_manifest:
+        try:
+            inventory = ArtifactCopier(
+                autocheckin_db, receipt_artifact_source, receipt_artifact_target
+            ).inventory()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise SystemExit(
+                f"unable to verify legacy artifact source: {exc}"
+            ) from exc
+        if (
+            not hmac.compare_digest(inventory.manifest_sha256, manifest_sha256)
+            or inventory.referenced_files != files
+            or inventory.referenced_bytes != size
+        ):
+            raise SystemExit(
+                "legacy artifact source manifest changed after preflight; "
+                "generate a new receipt"
+            )
     return receipt
 
 
@@ -176,7 +286,7 @@ def _claim_new_target(path: Path) -> None:
     except FileExistsError as exc:
         raise SystemExit(
             "apply requires a new target database path; move the existing target aside "
-            "or use --profiles-only for the supported profile-copy resume phase"
+            "or use an explicitly supported asset-only resume phase"
         ) from exc
 
 
@@ -212,20 +322,20 @@ def _load_receipt_binding(database: Database) -> dict[str, Any]:
                 "SELECT value_json FROM settings WHERE key=?", (RECEIPT_BINDING_SETTING,)
             ).fetchone()
     except Exception as exc:
-        raise SystemExit("profiles-only target is not a valid imported SiteHub database") from exc
+        raise SystemExit("asset-resume target is not a valid imported SiteHub database") from exc
     if integrity != "ok" or succeeded < 1:
-        raise SystemExit("profiles-only target has no successful, integral legacy migration")
+        raise SystemExit("asset-resume target has no successful, integral legacy migration")
     if row is None:
         raise SystemExit(
-            "profiles-only target has no persisted cutover receipt binding; "
-            "do not copy profiles into an unverified target"
+            "asset-resume target has no persisted cutover receipt binding; "
+            "do not copy files into an unverified target"
         )
     try:
         document = json.loads(str(row["value_json"]))
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise SystemExit("profiles-only target has an invalid receipt binding") from exc
+        raise SystemExit("asset-resume target has an invalid receipt binding") from exc
     if not isinstance(document, dict):
-        raise SystemExit("profiles-only target has an invalid receipt binding")
+        raise SystemExit("asset-resume target has an invalid receipt binding")
     return document
 
 
@@ -247,6 +357,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--profile-source", type=Path)
     parser.add_argument("--profile-target", type=Path)
+    parser.add_argument("--artifact-source", type=Path)
+    parser.add_argument("--artifact-target", type=Path)
     parser.add_argument(
         "--snapshot-root", type=Path,
         help="Controlled parent for apply snapshots (default: target sibling staging).",
@@ -260,6 +372,10 @@ def _parser() -> argparse.ArgumentParser:
         help="Hash profile files during analyze/dry-run without copying them.",
     )
     parser.add_argument(
+        "--include-artifact-inventory", action="store_true",
+        help="Hash legacy screenshots referenced by logs during analyze/dry-run.",
+    )
+    parser.add_argument(
         "--copy-profiles", action="store_true",
         help="During apply, copy profiles and verify their SHA-256 manifests.",
     )
@@ -270,7 +386,28 @@ def _parser() -> argparse.ArgumentParser:
             "already imported target (requires apply and --copy-profiles)."
         ),
     )
+    parser.add_argument(
+        "--copy-artifacts", action="store_true",
+        help="During apply, copy referenced screenshots and verify SHA-256 metadata.",
+    )
+    parser.add_argument(
+        "--artifacts-only", action="store_true",
+        help=(
+            "Resume only the independently recoverable artifact-copy phase on an "
+            "already imported target (requires apply and --copy-artifacts)."
+        ),
+    )
     return parser
+
+
+def _artifact_inventory_summary(inventory: Any) -> dict[str, int | str]:
+    return {
+        "manifest_sha256": inventory.manifest_sha256,
+        "referenced_files": inventory.referenced_files,
+        "referenced_bytes": inventory.referenced_bytes,
+        "unreferenced_files": inventory.unreferenced_files,
+        "unreferenced_bytes": inventory.unreferenced_bytes,
+    }
 
 
 def _print(value: object) -> None:
@@ -295,11 +432,20 @@ def main(argv: list[str] | None = None) -> int:
             # A throwaway sibling name is used only for path validation; it is never created.
             inventory_target = args.profile_target or args.profile_source.parent / "site-hub-profiles"
             manifests = ProfileCopier(args.profile_source, inventory_target).inventory()
-            output["profiles"] = {
-                "profiles": len(manifests),
-                "files": sum(item.file_count for item in manifests.values()),
-                "bytes": sum(item.total_bytes for item in manifests.values()),
-            }
+            output["profiles"] = profile_inventory_summary(manifests)
+        if args.include_artifact_inventory:
+            if args.artifact_source is None:
+                raise SystemExit(
+                    "--artifact-source is required for artifact inventory"
+                )
+            inventory_target = (
+                args.artifact_target
+                or args.artifact_source.parent / "site-hub-artifacts"
+            )
+            inventory = ArtifactCopier(
+                args.autocheckin_db, args.artifact_source, inventory_target
+            ).inventory()
+            output["artifacts"] = _artifact_inventory_summary(inventory)
         _print(output)
         return 0
 
@@ -356,11 +502,20 @@ def main(argv: list[str] | None = None) -> int:
                 manifests = ProfileCopier(
                     args.profile_source, inventory_target
                 ).inventory()
-                output["profiles"] = {
-                    "profiles": len(manifests),
-                    "files": sum(item.file_count for item in manifests.values()),
-                    "bytes": sum(item.total_bytes for item in manifests.values()),
-                }
+                output["profiles"] = profile_inventory_summary(manifests)
+            if args.include_artifact_inventory:
+                if args.artifact_source is None:
+                    raise SystemExit(
+                        "--artifact-source is required for artifact inventory"
+                    )
+                inventory_target = (
+                    args.artifact_target
+                    or args.artifact_source.parent / "site-hub-artifacts"
+                )
+                inventory = ArtifactCopier(
+                    args.autocheckin_db, args.artifact_source, inventory_target
+                ).inventory()
+                output["artifacts"] = _artifact_inventory_summary(inventory)
             _print(output)
         return 0
 
@@ -370,9 +525,19 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--copy-profiles requires --profile-source and --profile-target")
     if args.profiles_only and not args.copy_profiles:
         raise SystemExit("--profiles-only requires --copy-profiles")
-    if args.profiles_only and args.preflight_receipt is not None:
+    if args.copy_artifacts and (
+        args.artifact_source is None or args.artifact_target is None
+    ):
         raise SystemExit(
-            "--profiles-only uses the receipt binding persisted by the successful "
+            "--copy-artifacts requires --artifact-source and --artifact-target"
+        )
+    if args.artifacts_only and not args.copy_artifacts:
+        raise SystemExit("--artifacts-only requires --copy-artifacts")
+    if args.profiles_only and args.artifacts_only:
+        raise SystemExit("--profiles-only and --artifacts-only are mutually exclusive")
+    if (args.profiles_only or args.artifacts_only) and args.preflight_receipt is not None:
+        raise SystemExit(
+            "asset-only resume uses the receipt binding persisted by the successful "
             "business import; omit --preflight-receipt"
         )
 
@@ -384,10 +549,14 @@ def main(argv: list[str] | None = None) -> int:
         profile_source = args.profile_source.resolve()
         if target_resolved == profile_source or profile_source in target_resolved.parents:
             raise SystemExit("target database must not be inside the profile source")
+    if args.artifact_source is not None:
+        artifact_source = args.artifact_source.resolve()
+        if target_resolved == artifact_source or artifact_source in target_resolved.parents:
+            raise SystemExit("target database must not be inside the artifact source")
 
-    if args.profiles_only:
+    if args.profiles_only or args.artifacts_only:
         if not args.target_db.is_file():
-            raise SystemExit("--profiles-only requires an existing imported target database")
+            raise SystemExit("asset-only resume requires an existing imported target database")
         database = Database(args.target_db)
         binding = _load_receipt_binding(database)
         _validate_receipt_document(
@@ -395,15 +564,44 @@ def main(argv: list[str] | None = None) -> int:
             vshop_db=args.vshop_db.resolve(),
             autocheckin_db=args.autocheckin_db.resolve(),
             target_db=target_resolved,
-            profile_source=args.profile_source.resolve(),
-            profile_target=args.profile_target.resolve(),
+            profile_source=(
+                args.profile_source.resolve() if args.profile_source else None
+            ),
+            profile_target=(
+                args.profile_target.resolve() if args.profile_target else None
+            ),
+            artifact_source=(
+                args.artifact_source.resolve() if args.artifact_source else None
+            ),
+            artifact_target=(
+                args.artifact_target.resolve() if args.artifact_target else None
+            ),
             check_time=False,
+            check_profile_manifest=args.profiles_only,
+            check_artifact_manifest=args.artifacts_only,
         )
         importer = LegacyImporter(database, SecretService(database))
-        counts = importer.copy_autocheckin_profiles(
-            args.profile_source, args.profile_target
-        )
-        _print({"mode": "apply", "phase": "profiles", "profile_counts": counts})
+        if args.artifacts_only:
+            counts = importer.copy_autocheckin_artifacts(
+                args.autocheckin_db,
+                args.artifact_source,
+                args.artifact_target,
+                expected_manifest=str(binding["artifact_manifest"]["sha256"]),
+            )
+            _print({
+                "mode": "apply", "phase": "artifacts",
+                "artifact_counts": counts,
+            })
+        else:
+            counts = importer.copy_autocheckin_profiles(
+                args.profile_source,
+                args.profile_target,
+                expected_manifest=binding["profile_manifest"],
+            )
+            _print({
+                "mode": "apply", "phase": "profiles",
+                "profile_counts": counts,
+            })
         return 0
 
     if args.preflight_receipt is None:
@@ -420,6 +618,8 @@ def main(argv: list[str] | None = None) -> int:
         target_db=target_resolved,
         profile_source=args.profile_source.resolve() if args.profile_source else None,
         profile_target=args.profile_target.resolve() if args.profile_target else None,
+        artifact_source=args.artifact_source.resolve() if args.artifact_source else None,
+        artifact_target=args.artifact_target.resolve() if args.artifact_target else None,
         check_time=True,
     )
     planning = LegacyImporter(placeholder, None)  # type: ignore[arg-type]
@@ -431,7 +631,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.target_db.exists():
         raise SystemExit(
             "apply requires a new target database path; move the existing target aside "
-            "or use --profiles-only for the supported profile-copy resume phase"
+            "or use an explicitly supported asset-only resume phase"
         )
 
     database = Database(args.target_db)
@@ -466,17 +666,29 @@ def main(argv: list[str] | None = None) -> int:
             target_db=target_resolved,
             profile_source=args.profile_source.resolve() if args.profile_source else None,
             profile_target=args.profile_target.resolve() if args.profile_target else None,
+            artifact_source=args.artifact_source.resolve() if args.artifact_source else None,
+            artifact_target=args.artifact_target.resolve() if args.artifact_target else None,
             check_time=True,
+            check_profile_manifest=False,
         )
         _store_receipt_binding(database, receipt)
         recoverable_target = True
 
-        # Profile copy is deliberately a second, independently resumable phase.
-        # Once the successful import and binding exist, a Profile error preserves
-        # the target so --profiles-only can continue from the same frozen source.
+        # File copies are independent, resumable phases. Once the successful
+        # import and binding exist, failures preserve the target for asset-only
+        # continuation from the exact frozen receipt inputs.
+        if args.copy_artifacts:
+            report.artifact_counts = importer.copy_autocheckin_artifacts(
+                args.autocheckin_db,
+                args.artifact_source,
+                args.artifact_target,
+                expected_manifest=str(receipt["artifact_manifest"]["sha256"]),
+            )
         if args.copy_profiles:
             report.profile_counts = importer.copy_autocheckin_profiles(
-                args.profile_source, args.profile_target
+                args.profile_source,
+                args.profile_target,
+                expected_manifest=receipt["profile_manifest"],
             )
     except BaseException as exc:
         if target_claimed and not recoverable_target:

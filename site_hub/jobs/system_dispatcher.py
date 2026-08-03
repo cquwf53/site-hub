@@ -214,18 +214,64 @@ class SystemJobDispatcher:
             return {**report, "source_sha256": payload["sha256"], "source_size": payload["size"]}
         if kind == JobKind.LOGIN_SESSION:
             account_id = UUID(str(job["account_id"]))
-            setter = getattr(self.service.store, "set_account_auth_state", None)
+            action = str(payload.get("action") or "open")
+            if action not in {"open", "verify"}:
+                raise SystemExecutionError("unsupported login session action", error_kind="invalid_action")
+            setter = getattr(self.service.store, "set_account_profile_verification", None)
             if setter:
-                await setter(account_id, "opening")
+                await setter(account_id, "busy")
             try:
-                result = await self.supervisor.open_session(account_id)
+                result = (
+                    await self.supervisor.verify_session(account_id)
+                    if action == "verify"
+                    else await self.supervisor.open_session(account_id)
+                )
             except asyncio.TimeoutError as exc:
+                if setter:
+                    await setter(account_id, "error", "profile operation timed out")
                 raise SystemExecutionError(
-                    "login session outcome is unknown after worker timeout",
-                    error_kind="timeout", effect_unknown=True,
+                    "profile operation timed out",
+                    error_kind="timeout", effect_unknown=action == "open",
                 ) from exc
-            state = str(result.get("state") or "opened")[:64]
-            return {"account_id": str(account_id), "state": state, "worker_state": self.supervisor.state}
+            except Exception as exc:
+                if setter:
+                    await setter(account_id, "error", sanitize_log_value(exc, max_length=500))
+                raise
+            raw_state = str(result.get("state") or "error").lower()[:64]
+            state = (
+                "busy" if raw_state in {"starting", "running", "opened", "opening", "awaiting_user", "verifying", "busy"}
+                else raw_state if raw_state in {"ready", "expired", "error", "unverified"}
+                else "error"
+            )
+            # A verification RPC is complete when it returns.  Transient worker
+            # states therefore mean that the Profile could not be verified (for
+            # example, an external Chrome process owns its lock); persisting
+            # ``busy`` here would leave the account stuck until SiteHub restarts.
+            if action == "verify" and state == "busy":
+                state = "unverified"
+            error = sanitize_log_value(
+                result.get("error") or result.get("message") or "", max_length=500,
+            ) or None
+            if setter:
+                await setter(account_id, state, error, result.get("authenticatedAt"))
+            if state in {"expired", "error", "unverified"}:
+                error_kind = (
+                    "needs_login" if state in {"expired", "unverified"}
+                    else "verification_failed" if action == "verify"
+                    else "session_failed"
+                )
+                raise SystemExecutionError(
+                    error or (
+                        "Profile verification did not confirm an active login"
+                        if action == "verify"
+                        else "Login session could not be opened"
+                    ),
+                    error_kind=error_kind,
+                )
+            return {
+                "account_id": str(account_id), "action": action, "state": state,
+                "worker_state": self.supervisor.state,
+            }
         if kind == JobKind.ADAPTER_TEST:
             adapter_id = str(payload.get("adapter_id") or "")
             worker_ids = {

@@ -26,6 +26,7 @@ from site_hub.notifications import (
 from site_hub.scrapers.network import sanitize_log_value
 from site_hub.scheduling.coordinator import ScheduleCoordinator
 from site_hub.services.data_store import DataLayerStore
+from site_hub.services.ports import AccountNotReady
 from site_hub.services.events import EventBroker
 from site_hub.services.ports import Store
 from site_hub.services.single_instance import SingleInstanceLock
@@ -179,6 +180,13 @@ def _install_error_handlers(app: FastAPI) -> None:
         return error_response(409, "JOB_CONFLICT", str(exc), request_id=getattr(request.state, "request_id", None))
     app.add_exception_handler(JobConflict, job_conflict)
     app.add_exception_handler(StaleLease, job_conflict)
+
+    @app.exception_handler(AccountNotReady)
+    async def account_not_ready(request: Request, exc: AccountNotReady):
+        return error_response(
+            409, "ACCOUNT_NOT_READY", str(exc),
+            request_id=getattr(request.state, "request_id", None), field="enabled",
+        )
 
     @app.exception_handler(sqlite3.IntegrityError)
     async def integrity_error(request: Request, exc: sqlite3.IntegrityError):

@@ -194,6 +194,13 @@ async def open_login_session(request: Request, account_id: UUID):
     return _task_json(task)
 
 
+@router.post("/accounts/{account_id}/login-session/verify")
+async def verify_login_session(request: Request, account_id: UUID):
+    """Queue a read-only browser-profile authentication check."""
+    task, _ = await _jobs(request).enqueue_login_session(account_id, action="verify")
+    return _task_json(task)
+
+
 @router.get("/accounts/{account_id}/login-session")
 async def login_session_status(request: Request, account_id: UUID):
     return await request.app.state.supervisor.session_status(account_id)
