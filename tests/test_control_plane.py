@@ -15,6 +15,7 @@ from site_hub.main import create_app
 from site_hub.services.data_store import DataLayerStore
 from site_hub.services.events import EventBroker
 from site_hub.services.memory_store import MemoryStore
+from site_hub.services.ports import AccountNotReady
 from site_hub.services.secrets import EphemeralSecretProtector, SecretService
 
 
@@ -94,6 +95,54 @@ def test_product_settings_missing_site_is_consistently_not_found(tmp_path):
         )
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_profile_verify_route_queues_login_job_with_verify_action(tmp_path):
+    store = MemoryStore()
+    site = asyncio.run(store.create_site({
+        "name": "Check-in", "url": "https://example.test/account", "status": "active",
+    }))
+    account = asyncio.run(store.create_account(UUID(str(site["id"])), {
+        "name": "Primary", "adapter": "worker-adapter", "enabled": False,
+    }))
+    app = create_app(settings=_settings(tmp_path), store=store, start_background=False)
+
+    with TestClient(app, base_url=ORIGIN, headers={"Host": HOST}) as client:
+        response = client.post(
+            f"/api/v1/accounts/{account['id']}/login-session/verify",
+            headers=_csrf(client),
+        )
+        assert response.status_code == 200
+        task = response.json()
+        assert task["kind"] == "login_session"
+        queued = asyncio.run(store.get_job(UUID(task["jobId"])))
+        assert queued and queued["payload"] == {"action": "verify"}
+        blocked = client.patch(
+            f"/api/v1/accounts/{account['id']}", json={"enabled": True},
+            headers=_csrf(client),
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["error"] == {
+            "code": "ACCOUNT_NOT_READY",
+            "message": "Verify the browser Profile before enabling this account",
+            "field": "enabled",
+        }
+        blocked_run = client.post(
+            f"/api/v1/accounts/{account['id']}/run", headers=_csrf(client),
+        )
+        assert blocked_run.status_code == 409
+        assert blocked_run.json()["error"]["code"] == "ACCOUNT_NOT_READY"
+        assert blocked_run.json()["error"]["message"] == (
+            "Verify the browser Profile before running check-in"
+        )
+
+        direct = asyncio.run(store.create_account(UUID(str(site["id"])), {
+            "name": "Direct", "adapter": "api", "enabled": True,
+        }))
+        with pytest.raises(AccountNotReady):
+            asyncio.run(store.update_account(UUID(str(direct["id"])), {
+                "adapter": "playwright-generic",
+            }))
 
 
 def test_cancel_route_notifies_python_product_dispatcher(tmp_path):
@@ -747,11 +796,18 @@ async def test_checkin_account_reports_and_explicitly_unpauses_the_full_schedule
 
         public = (await store.list_accounts(UUID(str(site["id"]))))[0]
         assert public["enabled"] is False
+        assert public["auth_state"] == "unverified"
+        assert public["login_state"] == "unverified"
 
         # Ordinary edits preserve the cutover pause.
         edited = await store.update_account(UUID(str(account["id"])), {"name": "Renamed"})
         assert edited and edited["enabled"] is False
 
+        with pytest.raises(AccountNotReady):
+            await store.update_account(UUID(str(account["id"])), {"enabled": True})
+        await store.set_account_profile_verification(
+            UUID(str(account["id"])), "ready", verified_at="2026-08-03T12:00:00.000Z",
+        )
         enabled = await store.update_account(UUID(str(account["id"])), {"enabled": True})
         assert enabled and enabled["enabled"] is True
         with store.database.connect() as connection:
@@ -764,6 +820,28 @@ async def test_checkin_account_reports_and_explicitly_unpauses_the_full_schedule
                 (str(account["id"]),),
             ).fetchone()
         assert tuple(state) == (1, 1, 1)
+
+        direct = await store.create_account(UUID(str(site["id"])), {
+            "name": "Direct", "adapter": "api", "enabled": True,
+        })
+        with pytest.raises(AccountNotReady):
+            await store.update_account(UUID(str(direct["id"])), {
+                "adapter": "playwright-generic",
+            })
+        with pytest.raises(AccountNotReady):
+            await store.update_account(UUID(str(direct["id"])), {
+                "adapter": "playwright-generic", "enabled": True,
+            })
+        unchanged = await store.get_account(UUID(str(direct["id"])))
+        assert unchanged and unchanged["adapter"] == "api" and unchanged["enabled"] is True
+
+        paused = await store.update_account(UUID(str(direct["id"])), {"enabled": False})
+        assert paused and paused["enabled"] is False
+        switched = await store.update_account(UUID(str(direct["id"])), {
+            "adapter": "playwright-generic",
+        })
+        assert switched and switched["adapter"] == "playwright-generic"
+        assert switched["enabled"] is False
     finally:
         await store.close()
 
@@ -862,7 +940,8 @@ async def test_checkin_idempotency_is_account_and_shanghai_business_date_based()
     store = MemoryStore()
     site = await store.create_site({"name": "Example", "url": "https://example.test", "status": "active"})
     account = await store.create_account(UUID(str(site["id"])), {
-        "name": "Primary", "adapter": "worker", "enabled": True,
+        # This test exercises idempotency, not browser authentication.
+        "name": "Primary", "adapter": "api", "enabled": True,
     })
     service = JobService(store, EventBroker())
     due = datetime(2026, 8, 3, 16, 30, tzinfo=UTC)  # 2026-08-04 in Asia/Shanghai.

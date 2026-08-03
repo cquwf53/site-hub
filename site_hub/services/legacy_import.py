@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -38,6 +40,27 @@ _PROFILE_LOCK_NAMES = {
     "SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort",
 }
 
+# Keep this allow-list aligned with worker-node/src/adapter-manifests.js.  Legacy
+# AutoCheckin used `mode` for the broad runner and later added a top-level
+# `config.adapter` for dedicated Playwright runners.  SiteHub stores that choice
+# in capability_instances.adapter instead of leaving it in runtime config.
+_AUTOCHECKIN_ADAPTER_ALIASES = {
+    "api": "api",
+    "cookie": "cookie",
+    "browser": "playwright-generic",
+    "playwright": "playwright-generic",
+    "playwright-generic": "playwright-generic",
+    "xkool": "xkool",
+    "nodeloc": "nodeloc",
+    "nodeseek": "nodeseek",
+    "100xlabs": "hundredxlabs",
+    "hundredxlabs": "hundredxlabs",
+    "api123nhh": "api123nhh",
+    "jianzhile": "jianzhile",
+    "btschool": "btschool",
+    "52pojie": "52pojie",
+}
+
 
 def stable_id(source: str, entity_type: str, legacy_id: object) -> str:
     return str(uuid.uuid5(LEGACY_NAMESPACE, f"{source}:{entity_type}:{legacy_id}"))
@@ -53,6 +76,35 @@ def _sha256_file(path: Path) -> str:
 
 def _path_hash(path: Path) -> str:
     return hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = int(getattr(details, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return path.is_symlink() or bool(attributes & reparse_flag)
+
+
+def _assert_no_reparse_tree(root: Path, label: str) -> None:
+    if not root.exists():
+        return
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        if _is_reparse_point(current):
+            raise ValueError(f"{label} must not contain a reparse point")
+        if not current.is_dir():
+            continue
+        with os.scandir(current) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if _is_reparse_point(path):
+                    raise ValueError(f"{label} must not contain a reparse point")
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
 
 
 @contextmanager
@@ -171,6 +223,21 @@ def _job_status(status: Any, result_status: Any = None) -> str:
     return _run_status(result_status or status)
 
 
+def _normalize_autocheckin_adapter(config_adapter: Any, legacy_mode: Any) -> str:
+    """Return a supported SiteHub adapter ID for a legacy AutoCheckin site.
+
+    A known explicit adapter is more precise than the broad legacy mode.  An
+    unknown adapter is not retained because the API and dynamic form contract
+    only accept IDs advertised by the Worker manifests; instead, fall back to
+    the compatible broad mode, with generic Playwright as the safe default.
+    """
+    candidate = str(config_adapter or "").strip().lower()
+    if candidate in _AUTOCHECKIN_ADAPTER_ALIASES:
+        return _AUTOCHECKIN_ADAPTER_ALIASES[candidate]
+    mode = str(legacy_mode or "").strip().lower()
+    return _AUTOCHECKIN_ADAPTER_ALIASES.get(mode, "playwright-generic")
+
+
 def _batch_status(value: Any) -> str:
     lowered = str(value or "").lower()
     if lowered in {"completed", "success", "done"}:
@@ -225,6 +292,44 @@ def _url_suffix(value: Any) -> str | None:
     return text[min(positions):] if positions else None
 
 
+def _legacy_bool(value: Any, default: bool = False) -> bool:
+    parsed = _json_load(value, value)
+    if isinstance(parsed, bool):
+        return parsed
+    if isinstance(parsed, (int, float)):
+        return bool(parsed)
+    normalized = str(parsed or "").strip().casefold()
+    if normalized in {"true", "yes", "on", "1", "enabled"}:
+        return True
+    if normalized in {"false", "no", "off", "0", "disabled", ""}:
+        return False
+    return default
+
+
+def _valid_http_webhook(value: Any) -> str | None:
+    endpoint = str(value or "")
+    if (
+        endpoint != endpoint.strip()
+        or not endpoint
+        or len(endpoint) > 8192
+        or any(character in endpoint for character in ("\r", "\n", "\x00"))
+    ):
+        return None
+    try:
+        parsed = urlsplit(endpoint)
+        hostname = parsed.hostname
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return endpoint
+
+
 def _sensitive_plaintexts(vshop: Path, autocheckin: Path) -> set[bytes]:
     """Collect only values the importer promises to encrypt, never for reporting."""
     values: set[str] = set()
@@ -261,6 +366,10 @@ def _sensitive_plaintexts(vshop: Path, autocheckin: Path) -> set[bytes]:
         for row in _rows(source, "config"):
             key = str(_get(row, "key", _get(row, "name", "")))
             value = _get(row, "value", _get(row, "value_json", ""))
+            if key == "notify.webhook_type":
+                # An adapter/type selector is metadata, despite containing the
+                # word "webhook"; it is intentionally stored as a plain setting.
+                continue
             if _SENSITIVE_KEY.search(key) and value not in (None, ""):
                 values.add(str(value))
             else:
@@ -306,6 +415,7 @@ class MigrationPlan:
 class MigrationReport:
     migration_run_id: str
     counts: dict[str, int] = field(default_factory=dict)
+    artifact_counts: dict[str, int] = field(default_factory=dict)
     profile_counts: dict[str, int] = field(default_factory=dict)
     snapshot_sha256: dict[str, str] = field(default_factory=dict)
 
@@ -316,6 +426,7 @@ class MigrationReport:
         return {
             "migration_run_id": self.migration_run_id,
             "counts": dict(sorted(self.counts.items())),
+            "artifact_counts": dict(sorted(self.artifact_counts.items())),
             "profile_counts": dict(sorted(self.profile_counts.items())),
             "snapshot_sha256": dict(sorted(self.snapshot_sha256.items())),
         }
@@ -526,7 +637,11 @@ class LegacyImporter:
         legacy_id = _get(row, "id")
         site_id = stable_id(source, "site", legacy_id)
         sensitive = split_sensitive_url(
-            url, self.secrets, f"{source}.site.{legacy_id}.url_suffix", conn=target
+            url,
+            self.secrets,
+            f"{source}.site.{legacy_id}.url_suffix",
+            secret_id=stable_id(source, "secret", f"site:{legacy_id}:url_suffix"),
+            conn=target,
         )
         origin, host = _origin_and_host(sensitive.url_base)
         now = utc_now()
@@ -677,7 +792,13 @@ class LegacyImporter:
             product_ids[legacy_id] = product_id
             buy_url = str(_get(row, "buy_url", "") or "")
             buy = split_sensitive_url(
-                buy_url, self.secrets, f"vshop.product.{legacy_id}.buy_url_suffix", conn=target
+                buy_url,
+                self.secrets,
+                f"vshop.product.{legacy_id}.buy_url_suffix",
+                secret_id=stable_id(
+                    "vshop", "secret", f"product:{legacy_id}:buy_url_suffix"
+                ),
+                conn=target,
             ) if buy_url else None
             available = bool(_get(row, "is_available", 1))
             raw_tags = _json_load(_get(row, "tags"), [])
@@ -848,7 +969,13 @@ class LegacyImporter:
             record_id = stable_id("vshop", "legacy_tool", legacy_id)
             raw_url = str(_get(row, "url", "") or "")
             sensitive = split_sensitive_url(
-                raw_url, self.secrets, f"vshop.tool.{legacy_id}.url_suffix", conn=target
+                raw_url,
+                self.secrets,
+                f"vshop.tool.{legacy_id}.url_suffix",
+                secret_id=stable_id(
+                    "vshop", "secret", f"tool:{legacy_id}:url_suffix"
+                ),
+                conn=target,
             ) if raw_url else None
             tools.append({
                 "id": record_id,
@@ -928,13 +1055,17 @@ class LegacyImporter:
                 (account_id, site_id, "Default", int(enabled), now, now),
             )
             self._legacy_map(target, "autocheckin", "account", legacy_id, account_id)
-            mode = str(_get(row, "mode", "playwright-generic") or "playwright-generic")
-            adapter = {
-                "browser": "playwright-generic", "playwright": "playwright-generic",
-                "cookie": "cookie", "api": "api",
-            }.get(mode.lower(), mode)
             raw_config = _json_load(_get(row, "config"), {})
-            clean_config, extracted = _scrub_config(raw_config)
+            config_adapter = (
+                raw_config.get("adapter") if isinstance(raw_config, dict) else None
+            )
+            adapter = _normalize_autocheckin_adapter(
+                config_adapter, _get(row, "mode", "playwright")
+            )
+            runtime_config = dict(raw_config) if isinstance(raw_config, dict) else raw_config
+            if isinstance(runtime_config, dict):
+                runtime_config.pop("adapter", None)
+            clean_config, extracted = _scrub_config(runtime_config)
             clean_config = _runtime_capability_config(clean_config, extracted)
             capability_id = stable_id("autocheckin", "capability-checkin", legacy_id)
             capability_ids[legacy_id] = capability_id
@@ -951,14 +1082,21 @@ class LegacyImporter:
                 account_id=account_id,
             )
             schedule_id = stable_id("autocheckin", "schedule", legacy_id)
-            cron = str(_get(row, "cron", "") or "")
-            policy_type = "cron" if cron else "manual"
-            policy = {"expression": cron} if cron else {}
+            # AutoCheckin stored the same ``scheduler.default_cron`` value on
+            # every site, but its real automation was the global Shanghai-time
+            # random batch recorded in ``scheduler_batches``.  Treating that
+            # redundant column as an account override would silently change the
+            # migrated behavior to nine independent 08:00 jobs.  SiteHub keeps
+            # these accounts in the shared daily random window instead.  The
+            # schedule remains disabled until Profile verification and explicit
+            # user enablement complete.
+            policy_type = "daily_random_window"
+            policy: dict[str, Any] = {}
             target.execute(
                 """INSERT INTO schedules(
                     id,capability_instance_id,timezone,policy_type,policy_json,enabled,
                     misfire_policy,max_attempts,backoff_json,created_at,updated_at
-                ) VALUES(?,?,'Asia/Shanghai',?,?,0,'recover',1,'{}',?,?)""",
+                ) VALUES(?,?,'Asia/Shanghai',?,?,0,'recover',3,'{}',?,?)""",
                 (schedule_id, capability_id, policy_type, _json_dump(policy), now, now),
             )
             self._legacy_map(target, "autocheckin", "schedule", legacy_id, schedule_id)
@@ -1089,28 +1227,80 @@ class LegacyImporter:
         self, source: sqlite3.Connection, target: sqlite3.Connection,
         report: MigrationReport,
     ) -> None:
-        for index, row in enumerate(_rows(source, "config")):
+        rows = _rows(source, "config")
+        raw_values = {
+            str(_get(row, "key", _get(row, "name", f"legacy_{index}"))):
+                _get(row, "value", _get(row, "value_json", ""))
+            for index, row in enumerate(rows)
+        }
+        notifications_enabled = _legacy_bool(
+            raw_values.get("notify.enabled"), default=False,
+        )
+
+        def store_setting(key: str, value: Any) -> None:
+            target.execute(
+                """INSERT INTO settings(key,value_json,updated_at) VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,
+                       updated_at=excluded.updated_at""",
+                (f"legacy.autocheckin.{key}", _json_dump(value), utc_now()),
+            )
+            report.increment("settings")
+
+        for index, row in enumerate(rows):
             key = str(_get(row, "key", _get(row, "name", f"legacy_{index}")))
             value = _get(row, "value", _get(row, "value_json", ""))
-            if _SENSITIVE_KEY.search(key) and value not in (None, ""):
+
+            if key == "notify.webhook_type":
+                # This is an adapter/type selector, not a credential or endpoint.
+                store_setting(key, _json_load(value, value))
+                continue
+
+            if key == "notify.webhook_url":
+                endpoint = str(value or "")
+                if not endpoint:
+                    store_setting(key, "")
+                    continue
                 secret_id = self.secrets.store(
-                    f"autocheckin.config.{key}", str(value),
-                    secret_id=stable_id("autocheckin", "secret", f"config:{key}"), conn=target,
+                    f"autocheckin.config.{key}", endpoint,
+                    secret_id=stable_id("autocheckin", "secret", f"config:{key}"),
+                    conn=target,
                 )
-                if "webhook" in key.lower():
-                    channel_id = stable_id("autocheckin", "notification_channel", key)
+                valid_endpoint = _valid_http_webhook(endpoint)
+                store_setting(key, {
+                    "$secret_id": secret_id,
+                    "valid_endpoint": valid_endpoint is not None,
+                })
+                if valid_endpoint is not None:
+                    channel_id = stable_id(
+                        "autocheckin", "notification_channel", key,
+                    )
                     now = utc_now()
                     target.execute(
                         """INSERT INTO notification_channels(
                             id,name,channel_type,enabled,endpoint_secret_id,config_json,
                             created_at,updated_at
-                        ) VALUES(?,?,?,1,?,'{}',?,?)""",
-                        (channel_id, f"Imported {key}", "webhook", secret_id, now, now),
+                        ) VALUES(?,?,'webhook',?,?,'{}',?,?)""",
+                        (
+                            channel_id,
+                            "Imported webhook",
+                            int(notifications_enabled),
+                            secret_id,
+                            now,
+                            now,
+                        ),
                     )
                     self._legacy_map(
-                        target, "autocheckin", "notification_channel", key, channel_id
+                        target, "autocheckin", "notification_channel", key, channel_id,
                     )
                     report.increment("notification_channels")
+                continue
+
+            if _SENSITIVE_KEY.search(key) and value not in (None, ""):
+                secret_id = self.secrets.store(
+                    f"autocheckin.config.{key}", str(value),
+                    secret_id=stable_id("autocheckin", "secret", f"config:{key}"), conn=target,
+                )
+                store_setting(key, {"$secret_id": secret_id})
                 continue
             parsed = _json_load(value, value)
             clean, extracted = _scrub_config(parsed)
@@ -1125,16 +1315,11 @@ class LegacyImporter:
                         ), conn=target,
                     ))
                 clean = {"value": clean, "encrypted_legacy_fields": refs}
-            target.execute(
-                """INSERT INTO settings(key,value_json,updated_at) VALUES(?,?,?)
-                   ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,
-                       updated_at=excluded.updated_at""",
-                (f"legacy.autocheckin.{key}", _json_dump(clean), utc_now()),
-            )
-            report.increment("settings")
+            store_setting(key, clean)
 
     def copy_autocheckin_profiles(
-        self, source_root: str | Path, target_root: str | Path,
+        self, source_root: str | Path, target_root: str | Path, *,
+        expected_manifest: Mapping[str, Any] | None = None,
     ) -> dict[str, int]:
         """Copy site-* profiles, verify hashes, then register account bindings."""
         copier = ProfileCopier(Path(source_root), Path(target_root))
@@ -1147,7 +1332,10 @@ class LegacyImporter:
             }
         if not expected_legacy_ids:
             raise RuntimeError("target has no imported AutoCheckin accounts")
-        manifests = copier.copy_all(expected_legacy_site_ids=expected_legacy_ids)
+        manifests = copier.copy_all(
+            expected_legacy_site_ids=expected_legacy_ids,
+            expected_manifest=expected_manifest,
+        )
         with self.database.transaction(immediate=True) as target:
             for legacy_site_id, manifest in manifests.items():
                 account_id = stable_id("autocheckin", "account", legacy_site_id)
@@ -1185,6 +1373,271 @@ class LegacyImporter:
             "bytes": sum(item.total_bytes for item in manifests.values()),
         }
 
+    def copy_autocheckin_artifacts(
+        self,
+        autocheckin_db: str | Path,
+        source_root: str | Path,
+        target_root: str | Path,
+        expected_manifest: str | None = None,
+    ) -> dict[str, int]:
+        """Copy referenced screenshots and atomically bind verified metadata.
+
+        The frozen AutoCheckin database is the authority for both the legacy log
+        ID and filename. Existing target ``relative_path`` values are never used
+        to choose a source file, so a resume does not trust partially imported or
+        manually edited metadata.
+        """
+        copier = ArtifactCopier(
+            Path(autocheckin_db), Path(source_root), Path(target_root)
+        )
+        inventory = copier.inventory()
+        if expected_manifest is not None and (
+            inventory.manifest_sha256 != str(expected_manifest).strip().lower()
+        ):
+            raise RuntimeError("legacy artifact source manifest changed")
+
+        expected_entries = {entry.legacy_id: entry for entry in inventory.entries}
+        with self.database.connect() as target:
+            rows = target.execute(
+                """SELECT m.legacy_id,m.new_id,a.run_id,a.role
+                   FROM legacy_map m
+                   LEFT JOIN artifacts a ON a.id=m.new_id
+                   WHERE m.source='autocheckin' AND m.entity_type='artifact'"""
+            ).fetchall()
+        mapped = {str(row["legacy_id"]): row for row in rows}
+        if set(mapped) != set(expected_entries):
+            raise RuntimeError(
+                "target artifact mappings do not exactly match frozen AutoCheckin logs"
+            )
+        for legacy_id, row in mapped.items():
+            if (
+                row["new_id"] != stable_id("autocheckin", "artifact", legacy_id)
+                or row["run_id"] != stable_id("autocheckin", "run", legacy_id)
+                or row["role"] != "screenshot"
+            ):
+                raise RuntimeError("target artifact mapping failed deterministic validation")
+
+        copied = copier.copy_all(expected_manifest=expected_manifest)
+        now = utc_now()
+        with self.database.transaction(immediate=True) as target:
+            for entry in copied.entries:
+                artifact_id = stable_id("autocheckin", "artifact", entry.legacy_id)
+                updated = target.execute(
+                    """UPDATE artifacts
+                       SET relative_path=?,sha256=?,mime_type=?,size=?
+                       WHERE id=? AND role='screenshot'""",
+                    (
+                        entry.relative_path,
+                        entry.sha256,
+                        entry.mime_type,
+                        entry.size,
+                        artifact_id,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise RuntimeError("imported artifact disappeared before metadata binding")
+                mapped_count = target.execute(
+                    """UPDATE legacy_map SET source_fingerprint=?,imported_at=?
+                       WHERE source='autocheckin' AND entity_type='artifact'
+                         AND legacy_id=? AND new_id=?""",
+                    (entry.sha256, now, entry.legacy_id, artifact_id),
+                ).rowcount
+                if mapped_count != 1:
+                    raise RuntimeError("imported artifact mapping disappeared before binding")
+        return copied.to_counts()
+
+
+@dataclass(frozen=True)
+class ArtifactEntry:
+    legacy_id: str
+    filename: str
+    sha256: str
+    size: int
+    mime_type: str
+
+    @property
+    def relative_path(self) -> str:
+        return f"legacy/autocheckin/{self.filename}"
+
+
+@dataclass(frozen=True)
+class ArtifactInventory:
+    manifest_sha256: str
+    referenced_files: int
+    referenced_bytes: int
+    unreferenced_files: int
+    unreferenced_bytes: int
+    entries: tuple[ArtifactEntry, ...] = field(repr=False)
+
+    def to_counts(self) -> dict[str, int]:
+        return {
+            "artifacts": self.referenced_files,
+            "files": self.referenced_files,
+            "bytes": self.referenced_bytes,
+            "unreferenced_files": self.unreferenced_files,
+            "unreferenced_bytes": self.unreferenced_bytes,
+        }
+
+
+class ArtifactCopier:
+    """Inventory and copy only screenshots referenced by frozen legacy logs."""
+
+    def __init__(
+        self, autocheckin_db: Path, source_root: Path, target_root: Path,
+    ) -> None:
+        self.autocheckin_db = autocheckin_db.resolve()
+        self.source_root = source_root.resolve()
+        self.target_root = target_root.resolve()
+        if not self.autocheckin_db.is_file():
+            raise FileNotFoundError(self.autocheckin_db)
+        if not self.source_root.is_dir():
+            raise FileNotFoundError(self.source_root)
+        if (
+            self.target_root == self.source_root
+            or self.source_root in self.target_root.parents
+            or self.target_root in self.source_root.parents
+        ):
+            raise ValueError("artifact source and target trees must not overlap")
+
+    @staticmethod
+    def _filename(value: object) -> str:
+        raw = str(value or "").strip()
+        candidate = Path(raw)
+        if (
+            not raw
+            or candidate.is_absolute()
+            or candidate.drive
+            or candidate.name != raw
+            or "/" in raw
+            or "\\" in raw
+            or raw in {".", ".."}
+        ):
+            raise RuntimeError("legacy screenshot reference is not a safe flat filename")
+        return raw
+
+    def inventory(self) -> ArtifactInventory:
+        with _readonly(self.autocheckin_db) as source:
+            if "logs" not in _tables(source):
+                raise RuntimeError("legacy database has no logs table")
+            references = [
+                (str(row[0]), self._filename(row[1]))
+                for row in source.execute(
+                    """SELECT id,screenshot FROM logs
+                       WHERE trim(coalesce(screenshot,''))!='' ORDER BY id"""
+                )
+            ]
+
+        seen: set[str] = set()
+        referenced_names: set[str] = set()
+        entries: list[ArtifactEntry] = []
+        for legacy_id, filename in references:
+            normalized = filename.casefold()
+            if normalized in seen:
+                raise RuntimeError("legacy screenshot references contain duplicate filenames")
+            seen.add(normalized)
+            referenced_names.add(normalized)
+            source_file = (self.source_root / filename).resolve()
+            if source_file.parent != self.source_root or not source_file.is_file():
+                raise RuntimeError("referenced legacy screenshot is missing")
+            if source_file.is_symlink():
+                raise RuntimeError("referenced legacy screenshot must not be a symbolic link")
+            size = source_file.stat().st_size
+            digest = _sha256_file(source_file).lower()
+            mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            entries.append(
+                ArtifactEntry(legacy_id, filename, digest, size, mime_type)
+            )
+
+        entries.sort(key=lambda entry: entry.filename)
+        aggregate = hashlib.sha256()
+        for entry in entries:
+            aggregate.update(entry.filename.encode("utf-8"))
+            aggregate.update(b"\0")
+            aggregate.update(str(entry.size).encode("ascii"))
+            aggregate.update(b"\0")
+            aggregate.update(entry.sha256.encode("ascii"))
+            aggregate.update(b"\n")
+
+        source_files = [path for path in self.source_root.iterdir() if path.is_file()]
+        unreferenced = [
+            path for path in source_files
+            if path.name.casefold() not in referenced_names
+        ]
+        return ArtifactInventory(
+            manifest_sha256=aggregate.hexdigest(),
+            referenced_files=len(entries),
+            referenced_bytes=sum(entry.size for entry in entries),
+            unreferenced_files=len(unreferenced),
+            unreferenced_bytes=sum(path.stat().st_size for path in unreferenced),
+            entries=tuple(entries),
+        )
+
+    @staticmethod
+    def _verify_destination(
+        destination: Path, inventory: ArtifactInventory,
+    ) -> None:
+        if (
+            not destination.is_dir()
+            or destination.is_symlink()
+            or destination.resolve() != destination
+        ):
+            raise RuntimeError("artifact destination is not a controlled directory")
+        children = list(destination.iterdir())
+        if any(not child.is_file() or child.is_symlink() for child in children):
+            raise RuntimeError("artifact destination contains an unexpected entry")
+        actual = {child.name.casefold(): child for child in children}
+        expected = {entry.filename.casefold(): entry for entry in inventory.entries}
+        if set(actual) != set(expected):
+            raise RuntimeError("artifact destination file set failed verification")
+        for normalized, entry in expected.items():
+            target_file = actual[normalized]
+            if target_file.name != entry.filename:
+                raise RuntimeError("artifact destination filename case changed")
+            if (
+                target_file.stat().st_size != entry.size
+                or _sha256_file(target_file).lower() != entry.sha256
+            ):
+                raise RuntimeError("artifact destination failed SHA-256 verification")
+
+    def copy_all(self, *, expected_manifest: str | None = None) -> ArtifactInventory:
+        inventory = self.inventory()
+        if expected_manifest is not None and (
+            inventory.manifest_sha256 != str(expected_manifest).strip().lower()
+        ):
+            raise RuntimeError("legacy artifact source manifest changed")
+
+        self.target_root.mkdir(parents=True, exist_ok=True)
+        if self.target_root.resolve() != self.target_root:
+            raise RuntimeError("artifact target root changed during copy")
+        legacy_root = self.target_root / "legacy"
+        legacy_root.mkdir(exist_ok=True)
+        if (
+            not legacy_root.is_dir()
+            or legacy_root.is_symlink()
+            or legacy_root.resolve() != legacy_root
+        ):
+            raise RuntimeError("artifact legacy root is not a controlled directory")
+        destination = legacy_root / "autocheckin"
+        if destination.exists():
+            self._verify_destination(destination, inventory)
+            return inventory
+
+        staging = self.target_root / f".legacy-autocheckin.tmp-{uuid.uuid4()}"
+        try:
+            staging.mkdir(parents=False)
+            for entry in inventory.entries:
+                shutil.copy2(
+                    self.source_root / entry.filename,
+                    staging / entry.filename,
+                )
+            self._verify_destination(staging, inventory)
+            os.replace(staging, destination)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+        self._verify_destination(destination, inventory)
+        return inventory
+
 
 @dataclass(frozen=True)
 class ProfileManifest:
@@ -1195,17 +1648,45 @@ class ProfileManifest:
     total_bytes: int
 
 
+def profile_inventory_summary(
+    manifests: Mapping[str, ProfileManifest],
+) -> dict[str, int | str]:
+    aggregate = hashlib.sha256()
+    for legacy_site_id, item in sorted(manifests.items()):
+        aggregate.update(str(legacy_site_id).encode("utf-8"))
+        aggregate.update(b"\0")
+        aggregate.update(item.manifest_sha256.encode("ascii"))
+        aggregate.update(b"\n")
+    return {
+        "profiles": len(manifests),
+        "files": sum(item.file_count for item in manifests.values()),
+        "bytes": sum(item.total_bytes for item in manifests.values()),
+        "sha256": aggregate.hexdigest(),
+    }
+
+
 class ProfileCopier:
     def __init__(self, source_root: Path, target_root: Path):
-        self.source_root = source_root.resolve()
-        self.target_root = target_root.resolve()
-        if not self.source_root.is_dir():
-            raise FileNotFoundError(self.source_root)
-        if self.target_root == self.source_root or self.source_root in self.target_root.parents:
-            raise ValueError("profile target must not be inside the source tree")
+        source_path = Path(os.path.abspath(os.fspath(source_root)))
+        target_path = Path(os.path.abspath(os.fspath(target_root)))
+        if not source_path.is_dir():
+            raise FileNotFoundError(source_path)
+        if target_path.exists() and not target_path.is_dir():
+            raise ValueError("profile target must be a directory")
+        _assert_no_reparse_tree(source_path, "profile source")
+        _assert_no_reparse_tree(target_path, "profile target")
+        self.source_root = source_path.resolve()
+        self.target_root = target_path.resolve()
+        if (
+            self.target_root == self.source_root
+            or self.source_root in self.target_root.parents
+            or self.target_root in self.source_root.parents
+        ):
+            raise ValueError("profile source and target trees must not overlap")
 
     @staticmethod
     def _included_files(root: Path) -> Iterator[Path]:
+        _assert_no_reparse_tree(root, "profile tree")
         for path in sorted(root.rglob("*")):
             if path.is_file() and path.name not in _PROFILE_LOCK_NAMES:
                 yield path
@@ -1229,6 +1710,7 @@ class ProfileCopier:
         return aggregate.hexdigest(), count, total
 
     def inventory(self) -> dict[str, ProfileManifest]:
+        _assert_no_reparse_tree(self.source_root, "profile source")
         result: dict[str, ProfileManifest] = {}
         for directory in sorted(self.source_root.glob("site-*")):
             if not directory.is_dir():
@@ -1243,8 +1725,22 @@ class ProfileCopier:
 
     def copy_all(
         self, *, expected_legacy_site_ids: set[str] | None = None,
+        expected_manifest: Mapping[str, Any] | None = None,
     ) -> dict[str, ProfileManifest]:
         source_manifests = self.inventory()
+        if expected_manifest is not None:
+            current = profile_inventory_summary(source_manifests)
+            try:
+                expected = {
+                    "profiles": int(expected_manifest["profiles"]),
+                    "files": int(expected_manifest["files"]),
+                    "bytes": int(expected_manifest["bytes"]),
+                    "sha256": str(expected_manifest["sha256"]).strip().lower(),
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("expected Profile manifest is invalid") from exc
+            if current != expected:
+                raise RuntimeError("legacy Profile source manifest changed")
         if expected_legacy_site_ids is not None:
             actual = set(source_manifests)
             if actual != expected_legacy_site_ids:
@@ -1255,6 +1751,7 @@ class ProfileCopier:
                     f"(missing={missing}, unexpected={unexpected})"
                 )
         self.target_root.mkdir(parents=True, exist_ok=True)
+        _assert_no_reparse_tree(self.target_root, "profile target")
         result: dict[str, ProfileManifest] = {}
         for legacy_site_id, source_manifest in source_manifests.items():
             relative_path = stable_id("autocheckin", "account", legacy_site_id)
@@ -1292,16 +1789,21 @@ class ProfileCopier:
                 legacy_site_id, relative_path, source_manifest.manifest_sha256,
                 source_manifest.file_count, source_manifest.total_bytes,
             )
+        _assert_no_reparse_tree(self.target_root, "profile target")
         return result
 
 
 __all__ = [
+    "ArtifactCopier",
+    "ArtifactEntry",
+    "ArtifactInventory",
     "FROZEN_SNAPSHOT_COUNTS",
     "LegacyImporter",
     "MigrationPlan",
     "MigrationReport",
     "ProfileCopier",
     "ProfileManifest",
+    "profile_inventory_summary",
     "SourcePlan",
     "backup_sqlite_database",
     "stable_id",

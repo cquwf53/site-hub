@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from site_hub.models import JobKind, JobOut, JobStatus, TaskRef
 from site_hub.services.events import EventBroker
-from site_hub.services.ports import Store
+from site_hub.services.ports import AccountNotReady, Store
 
 
 def utcnow() -> datetime:
@@ -40,6 +40,13 @@ class JobService:
         site = await self.store.get_site(UUID(str(account["site_id"])))
         if not site:
             raise JobNotFound("site not found")
+        adapter = str(account.get("adapter") or "").lower()
+        if adapter not in {"api", "cookie"} and account.get("auth_state") != "ready":
+            raise AccountNotReady("Verify the browser Profile before running check-in")
+        if not bool(account.get("enabled")):
+            raise AccountNotReady("Enable this account before running check-in")
+        if str(site.get("status") or "active") != "active":
+            raise JobConflict("site is not active")
         now = utcnow()
         due = scheduled_for or now
         business_date = due.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
@@ -91,7 +98,11 @@ class JobService:
             payload={"staging_path": relative_path, "sha256": sha256, "size": size},
         )
 
-    async def enqueue_login_session(self, account_id: UUID) -> tuple[TaskRef, bool]:
+    async def enqueue_login_session(
+        self, account_id: UUID, *, action: str = "open",
+    ) -> tuple[TaskRef, bool]:
+        if action not in {"open", "verify"}:
+            raise ValueError("unsupported login session action")
         account = await self.store.get_account(account_id)
         if not account:
             raise JobNotFound("check-in account not found")
@@ -100,6 +111,7 @@ class JobService:
             raise JobNotFound("site not found")
         return await self._enqueue_system(
             JobKind.LOGIN_SESSION, site_id=site_id, account_id=account_id, max_attempts=2,
+            payload={"action": action},
         )
 
     async def enqueue_adapter_test(self, adapter_id: str) -> tuple[TaskRef, bool]:

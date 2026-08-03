@@ -6,6 +6,9 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+from site_hub.scrapers.network import sanitize_log_value
+from site_hub.services.ports import AccountNotReady
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -146,6 +149,8 @@ class MemoryStore:
         config = payload.get("config") or {}
         public_payload = dict(payload)
         public_payload.pop("config", None)
+        adapter = str(public_payload.get("adapter") or "playwright")
+        public_payload["enabled"] = bool(public_payload.get("enabled", False)) and adapter.lower() in {"api", "cookie"}
         public_config, secret_fields = _public_config(config)
         row = {"id": account_id, "site_id": site_id, "profile_key": str(account_id),
                "profile": {"relative_path": str(account_id), "state": "unverified",
@@ -153,7 +158,7 @@ class MemoryStore:
                            "last_verified_at": None, "verification_error": None},
                "configured": bool(public_config or secret_fields), "configured_secret_fields": secret_fields,
                "config": public_config,
-               "login_state": "not_configured", "created_at": _now().isoformat(),
+               "auth_state": "unverified", "login_state": "unverified", "created_at": _now().isoformat(),
                "updated_at": None, **public_payload}
         self.accounts[account_id] = row
         if site_id in self.sites: self.sites[site_id]["checkin_account_count"] += 1
@@ -163,6 +168,17 @@ class MemoryStore:
         account_id = UUID(str(account_id)); row = self.accounts.get(account_id)
         if not row: return None
         payload = dict(payload)
+        next_adapter = str(payload.get("adapter", row.get("adapter")) or "").lower()
+        next_enabled = bool(payload["enabled"]) if "enabled" in payload else bool(row.get("enabled"))
+        activation_requested = payload.get("enabled") is True or (
+            "adapter" in payload and next_enabled
+        )
+        if (
+            activation_requested
+            and next_adapter not in {"api", "cookie"}
+            and row.get("auth_state") != "ready"
+        ):
+            raise AccountNotReady("Verify the browser Profile before enabling this account")
         clear_secrets = set(payload.pop("clear_secrets", []) or [])
         if "config" in payload:
             clean, new_secrets = _public_config(payload["config"] or {})
@@ -207,6 +223,47 @@ class MemoryStore:
         if not row: return None
         row["auth_state"] = state; row["login_state"] = state
         row["verification_error"] = error; row["updated_at"] = _now().isoformat()
+        return deepcopy(row)
+
+    async def set_account_profile_verification(
+        self, account_id, state, error=None, verified_at=None,
+    ):
+        row = self.accounts.get(UUID(str(account_id)))
+        if not row or row.get("auth_state") == "disabled": return None
+        normalized = state if state in {"ready", "expired", "error", "busy", "unverified"} else "error"
+        safe_error = sanitize_log_value(error, max_length=500) if error else None
+        profile = row.setdefault("profile", {
+            "relative_path": str(account_id), "state": "unverified",
+            "manifest_sha256": None, "file_count": None, "total_bytes": None,
+            "last_verified_at": None, "verification_error": None,
+        })
+        if normalized == "busy":
+            profile["state"] = "busy"
+            profile["verification_error"] = safe_error
+        else:
+            account_state = normalized if normalized in {"ready", "expired", "error"} else "unverified"
+            row["auth_state"] = account_state; row["login_state"] = account_state
+            row["verification_error"] = safe_error
+            profile["state"] = "ready" if normalized == "ready" else (
+                "unverified" if normalized == "unverified" else "error"
+            )
+            profile["verification_error"] = safe_error
+            if normalized == "ready":
+                timestamp = verified_at or _now().isoformat()
+                row["last_verified_at"] = timestamp
+                profile["last_verified_at"] = timestamp
+                row["verification_error"] = None
+                profile["verification_error"] = None
+            else:
+                row["enabled"] = False
+                now = _now()
+                for job in self.jobs.values():
+                    if job.get("kind") == "checkin" and job.get("account_id") == UUID(str(account_id)) and job["status"] == "queued":
+                        job.update(
+                            status="cancelled", finished_at=now,
+                            result={"reason_code": "disabled", "cancelled_before_start": True},
+                        )
+        row["updated_at"] = _now().isoformat()
         return deepcopy(row)
 
     async def get_product_settings(self, site_id):

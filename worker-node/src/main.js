@@ -43,6 +43,21 @@ function asSite(params) {
   };
 }
 
+function emitSessionEvent(params, action, result = {}) {
+  try {
+    peer.notify('session.event', {
+      accountId: String(params.accountId || params.account?.id || ''),
+      action,
+      state: String(result.state || 'error'),
+      authenticatedAt: result.authenticatedAt || null,
+      currentUrl: result.currentUrl || '',
+      error: result.error ? redactText(result.error, 1000) : null,
+    });
+  } catch (error) {
+    stderr('[worker] session event was not delivered:', error?.message || error);
+  }
+}
+
 async function cleanupOwnedProcesses() {
   await loginSessionManager.closeAll().catch(error => {
     stderr('[worker] login-session cleanup failed:', error?.message || error);
@@ -206,7 +221,14 @@ peer.handle('job.cancel', async params => {
   return { accepted: true };
 });
 
-peer.handle('session.open', async params => loginSessionManager.startSystemChrome(asSite(params)));
+peer.handle('session.open', async params => {
+  const site = asSite(params);
+  return await loginSessionManager.startSystemChrome(
+    site,
+    result => emitSessionEvent(params, 'login_complete', result),
+  );
+});
+peer.handle('session.verify', async params => loginSessionManager.verify(asSite(params)));
 peer.handle('session.status', async params => loginSessionManager.getStatus(asSite(params)));
 peer.handle('session.close', async params => ({
   closed: await loginSessionManager.close(String(params.accountId || params.account?.id || '')),
@@ -245,7 +267,7 @@ async function performHandshake() {
       protocol: PROTOCOL_VERSION,
       pid: process.pid,
       build: '0.1.0',
-      capabilities: ['checkin', 'login_session'],
+      capabilities: ['checkin', 'login_session', 'profile_verify'],
       adapters: adapterManifests,
     }, 10000);
     if (Number(helloAck?.protocol) !== PROTOCOL_VERSION) {

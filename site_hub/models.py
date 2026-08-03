@@ -163,7 +163,7 @@ class CheckinAccountCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     name: str = Field(min_length=1, max_length=200, validation_alias=AliasChoices("name", "label"))
     adapter: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-    enabled: bool = True
+    enabled: bool = False
     schedule_override: CheckinScheduleOverride | None = Field(default=None, validation_alias=AliasChoices("schedule_override", "schedule"))
     config: dict[str, Any] = Field(default_factory=dict)
 

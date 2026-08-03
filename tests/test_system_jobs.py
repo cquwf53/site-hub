@@ -26,6 +26,12 @@ class FakeSupervisor:
         self.opened = asyncio.Event()
         self.release = asyncio.Event()
         self.closed: list[UUID] = []
+        self.verified: list[UUID] = []
+        self.verify_result = {
+            "state": "ready",
+            "authenticatedAt": "2026-08-03T12:00:00.000Z",
+            "currentUrl": "https://example.test/account",
+        }
 
     async def open_session(self, account_id: UUID):
         self.opened.set()
@@ -35,6 +41,10 @@ class FakeSupervisor:
     async def close_session(self, account_id: UUID):
         self.closed.append(account_id)
         return {"closed": True}
+
+    async def verify_session(self, account_id: UUID):
+        self.verified.append(account_id)
+        return dict(self.verify_result)
 
 
 async def wait_for_job(store, job_id: UUID, statuses: set[str], timeout: float = 3.0):
@@ -73,6 +83,183 @@ async def test_global_adapter_job_is_durable_and_visible_in_run_history(tmp_path
     finally:
         await dispatcher.stop()
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_profile_verification_atomically_updates_account_and_profile(tmp_path):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    supervisor = FakeSupervisor()
+    jobs = JobService(store, EventBroker(), lease_seconds=1)
+    dispatcher = SystemJobDispatcher(
+        jobs, supervisor=supervisor, staging=BookmarkStaging(tmp_path / "staging"),
+        interval_seconds=0.01,
+    )
+    try:
+        site = await store.create_site({
+            "name": "Site", "url": "https://example.test", "status": "active",
+        })
+        account = await store.create_account(UUID(str(site["id"])), {
+            "name": "Primary", "adapter": "worker-adapter", "enabled": False,
+        })
+        account_id = UUID(str(account["id"]))
+        task, created = await jobs.enqueue_login_session(account_id, action="verify")
+        assert created is True
+        queued = await store.get_job(task.job_id)
+        assert queued and queued["payload"] == {"action": "verify"}
+
+        dispatcher.start()
+        completed = await wait_for_job(store, task.job_id, {"succeeded"})
+        assert completed["result"] == {
+            "account_id": str(account_id), "action": "verify", "state": "ready",
+            "worker_state": "ready",
+        }
+        assert supervisor.verified == [account_id]
+        verified = await store.get_account(account_id)
+        assert verified and verified["auth_state"] == "ready"
+        assert verified["profile"]["state"] == "ready"
+        assert verified["profile"]["last_verified_at"] == "2026-08-03T12:00:00.000Z"
+    finally:
+        await dispatcher.stop()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_busy_profile_verification_is_retryable_not_permanent_busy(tmp_path):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    supervisor = FakeSupervisor()
+    supervisor.verify_result = {
+        "state": "busy",
+        "error": "Profile is in use; close the browser and retry",
+    }
+    jobs = JobService(store, EventBroker(), lease_seconds=1)
+    dispatcher = SystemJobDispatcher(
+        jobs, supervisor=supervisor, staging=BookmarkStaging(tmp_path / "staging"),
+        interval_seconds=0.01,
+    )
+    try:
+        site = await store.create_site({
+            "name": "Site", "url": "https://example.test", "status": "active",
+        })
+        account = await store.create_account(UUID(str(site["id"])), {
+            "name": "Primary", "adapter": "worker-adapter", "enabled": False,
+        })
+        account_id = UUID(str(account["id"]))
+        task, _ = await jobs.enqueue_login_session(account_id, action="verify")
+
+        dispatcher.start()
+        completed = await wait_for_job(store, task.job_id, {"failed"})
+        assert completed["error_kind"] == "needs_login"
+        assert "close the browser" in completed["error_message"]
+        verified = await store.get_account(account_id)
+        assert verified and verified["auth_state"] == "unverified"
+        assert verified["profile"]["state"] == "unverified"
+        assert verified["profile"]["verification_error"] == supervisor.verify_result["error"]
+    finally:
+        await dispatcher.stop()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_profile_state_does_not_overwrite_terminal_account_auth_state(tmp_path):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    try:
+        site = await store.create_site({
+            "name": "Site", "url": "https://example.test", "status": "active",
+        })
+        account = await store.create_account(UUID(str(site["id"])), {
+            "name": "Primary", "adapter": "worker-adapter", "enabled": False,
+        })
+        account_id = UUID(str(account["id"]))
+        await store.set_account_profile_verification(
+            account_id, "ready", verified_at="2026-08-03T12:00:00.000Z",
+        )
+        busy = await store.set_account_profile_verification(account_id, "busy")
+        assert busy and busy["auth_state"] == "ready"
+        assert busy["profile"]["state"] == "busy"
+        assert busy["profile"]["last_verified_at"] == "2026-08-03T12:00:00.000Z"
+
+        enabled = await store.update_account(account_id, {"enabled": True})
+        assert enabled and enabled["enabled"] is True
+        expired = await store.set_account_profile_verification(
+            account_id, "expired", "Login expired",
+        )
+        assert expired and expired["auth_state"] == "expired"
+        assert expired["profile"]["state"] == "error"
+        assert expired["enabled"] is False
+        with store.database.connect() as connection:
+            flags = connection.execute(
+                """SELECT a.enabled,c.enabled,s.enabled FROM site_accounts a
+                   JOIN capability_instances c ON c.account_id=a.id AND c.code='checkin'
+                   JOIN schedules s ON s.capability_instance_id=c.id WHERE a.id=?""",
+                (str(account_id),),
+            ).fetchone()
+        assert tuple(flags) == (0, 0, 0)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_new_browser_account_stays_disabled_until_profile_is_verified(tmp_path):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    try:
+        site = await store.create_site({
+            "name": "Site", "url": "https://example.test", "status": "active",
+        })
+        browser = await store.create_account(UUID(str(site["id"])), {
+            "name": "Browser", "adapter": "worker-adapter", "enabled": True,
+        })
+        direct = await store.create_account(UUID(str(site["id"])), {
+            "name": "Direct", "adapter": "api", "enabled": True,
+        })
+        assert browser["enabled"] is False
+        assert browser["auth_state"] == "unverified"
+        assert direct["enabled"] is True
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_profile_verification_disables_automation_on_restart(tmp_path):
+    database_path = tmp_path / "site-hub.db"
+    store = DataLayerStore(database_path)
+    await store.initialize()
+    site = await store.create_site({
+        "name": "Site", "url": "https://example.test", "status": "active",
+    })
+    account = await store.create_account(UUID(str(site["id"])), {
+        "name": "Browser", "adapter": "worker-adapter", "enabled": False,
+    })
+    account_id = UUID(str(account["id"]))
+    await store.set_account_profile_verification(account_id, "ready")
+    enabled = await store.update_account(account_id, {"enabled": True})
+    assert enabled and enabled["enabled"] is True
+    task, _ = await JobService(store, EventBroker()).enqueue_checkin(account_id)
+    busy = await store.set_account_profile_verification(account_id, "busy")
+    assert busy and busy["profile"]["state"] == "busy" and busy["enabled"] is True
+    await store.close()
+
+    reopened = DataLayerStore(database_path)
+    await reopened.initialize()
+    try:
+        recovered = await reopened.get_account(account_id)
+        assert recovered and recovered["auth_state"] == "unverified"
+        assert recovered["profile"]["state"] == "unverified"
+        assert recovered["enabled"] is False
+        assert (await reopened.get_job(task.job_id))["status"] == "cancelled"
+        with reopened.database.connect() as connection:
+            flags = connection.execute(
+                """SELECT a.enabled,c.enabled,s.enabled FROM site_accounts a
+                   JOIN capability_instances c ON c.account_id=a.id AND c.code='checkin'
+                   JOIN schedules s ON s.capability_instance_id=c.id WHERE a.id=?""",
+                (str(account_id),),
+            ).fetchone()
+        assert tuple(flags) == (0, 0, 0)
+    finally:
+        await reopened.close()
 
 
 @pytest.mark.asyncio

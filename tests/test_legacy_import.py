@@ -10,14 +10,18 @@ from uuid import UUID
 
 import pytest
 import tools.migrate_legacy as migrate_cli
+import site_hub.services.legacy_import as legacy_import_module
 
 from site_hub.db import Database
 from site_hub.services.legacy_import import (
+    ArtifactCopier,
     FROZEN_SNAPSHOT_COUNTS,
     LegacyImporter,
     ProfileCopier,
+    profile_inventory_summary,
     _batch_status,
     _job_status,
+    _normalize_autocheckin_adapter,
     backup_sqlite_database,
     stable_id,
 )
@@ -36,6 +40,41 @@ def test_legacy_nonterminal_jobs_are_archived_not_requeued() -> None:
     for status in ("pending", "planned", "queued", "waiting", "running", "started", "processing"):
         assert _batch_status(status) == "cancelled"
     assert _batch_status("completed") == "completed"
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    (
+        "xkool", "nodeloc", "nodeseek", "hundredxlabs", "api123nhh",
+        "jianzhile", "btschool", "52pojie",
+    ),
+)
+def test_autocheckin_dedicated_adapters_are_preserved(adapter: str) -> None:
+    assert _normalize_autocheckin_adapter(adapter, "playwright") == adapter
+
+
+def test_autocheckin_100xlabs_adapter_uses_worker_manifest_id() -> None:
+    assert _normalize_autocheckin_adapter(
+        " 100xLabs ", "playwright"
+    ) == "hundredxlabs"
+
+
+@pytest.mark.parametrize(
+    ("config_adapter", "legacy_mode", "expected"),
+    (
+        (None, "playwright", "playwright-generic"),
+        (None, "browser", "playwright-generic"),
+        (None, "api", "api"),
+        (None, "cookie", "cookie"),
+        ("PLAYWRIGHT", "cookie", "playwright-generic"),
+        ("future-adapter", "cookie", "cookie"),
+        ("future-adapter", "future-mode", "playwright-generic"),
+    ),
+)
+def test_autocheckin_adapter_falls_back_to_a_supported_legacy_mode(
+    config_adapter: str | None, legacy_mode: str, expected: str,
+) -> None:
+    assert _normalize_autocheckin_adapter(config_adapter, legacy_mode) == expected
 
 
 def _make_vshop(path: Path) -> None:
@@ -111,7 +150,7 @@ def _make_auto(path: Path, *, orphan_job: bool = False) -> None:
           '{"cookie":"fake-cookie-secret","wait_ms":100}',
           '0 8 * * *',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',0
         );
-        INSERT INTO logs VALUES(1,1,'success','signed in','shots/one.png',100,'2026-01-01T08:00:00Z');
+        INSERT INTO logs VALUES(1,1,'success','signed in','one.png',100,'2026-01-01T08:00:00Z');
         INSERT INTO scheduler_batches VALUES(
           1,'2026-01-01','2026-01-01T08:00:00Z',NULL,'normal','completed',
           '2026-01-01T08:00:00Z','2026-01-01T08:01:00Z',
@@ -138,6 +177,155 @@ def _importer(target: Path) -> tuple[Database, LegacyImporter, SecretService]:
     return database, LegacyImporter(database, service), service
 
 
+def test_autocheckin_adapter_is_removed_before_sensitive_config_is_stored(tmp_path):
+    vshop, auto, target = tmp_path / "vshop.db", tmp_path / "auto.db", tmp_path / "target.db"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    sensitive_value = "fake-dedicated-auth-secret"
+    with sqlite3.connect(auto) as connection:
+        connection.execute(
+            """INSERT INTO sites(
+                   id,name,url,mode,config,cron,enabled,created_at,updated_at,sort_order
+               ) VALUES(2,?,?,?,?,?,1,?,?,1)""",
+            (
+                "Dedicated", "https://sub.100xlabs.space/dashboard", "playwright",
+                json.dumps({
+                    "adapter": "100xlabs",
+                    "headless": False,
+                    "headers": {"Authorization": sensitive_value},
+                }),
+                "0 8 * * *", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+            ),
+        )
+
+    database, importer, secrets = _importer(target)
+    database.initialize()
+    importer.execute(vshop, auto, expected_counts=None)
+    capability_id = stable_id("autocheckin", "capability-checkin", 2)
+    account_id = stable_id("autocheckin", "account", 2)
+    with database.connect() as connection:
+        capability = connection.execute(
+            "SELECT adapter,config_json FROM capability_instances WHERE id=?",
+            (capability_id,),
+        ).fetchone()
+        assert capability is not None
+        assert capability["adapter"] == "hundredxlabs"
+        stored_config = json.loads(capability["config_json"])
+        assert "adapter" not in stored_config
+        assert stored_config["headless"] is False
+        assert stored_config["headers"] == {}
+        assert stored_config["_secret_fields"] == ["headers.Authorization"]
+
+    runtime_store = DataLayerStore(target)
+    runtime_store.secret_service = secrets
+    account = asyncio.run(runtime_store.get_account(UUID(account_id)))
+    assert account is not None
+    assert account["adapter"] == "hundredxlabs"
+    assert account["runtime_config"]["headers"]["Authorization"] == sensitive_value
+    assert sensitive_value.encode() not in target.read_bytes()
+
+
+def test_disabled_empty_legacy_webhook_does_not_create_a_channel(tmp_path) -> None:
+    vshop, auto, target = tmp_path / "vshop.db", tmp_path / "auto.db", tmp_path / "target.db"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    with sqlite3.connect(auto) as connection:
+        connection.executemany(
+            "INSERT INTO config(key,value) VALUES(?,?)",
+            (
+                ("notify.enabled", "false"),
+                ("notify.webhook_type", "legacy-type"),
+                ("notify.webhook_url", ""),
+            ),
+        )
+    database, importer, _ = _importer(target)
+    database.initialize()
+    report = importer.execute(vshop, auto, expected_counts=None)
+
+    assert report.counts.get("notification_channels", 0) == 0
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM notification_channels"
+        ).fetchone()[0] == 0
+        webhook_type = connection.execute(
+            "SELECT value_json FROM settings WHERE key=?",
+            ("legacy.autocheckin.notify.webhook_type",),
+        ).fetchone()[0]
+        assert json.loads(webhook_type) == "legacy-type"
+        assert connection.execute(
+            "SELECT count(*) FROM secrets WHERE purpose LIKE '%notify.webhook%'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("enabled", (False, True))
+def test_valid_legacy_webhook_preserves_enabled_state(tmp_path, enabled: bool) -> None:
+    vshop, auto, target = tmp_path / "vshop.db", tmp_path / "auto.db", tmp_path / "target.db"
+    endpoint = "https://hooks.test/notify?token=fake-webhook-secret"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    with sqlite3.connect(auto) as connection:
+        connection.executemany(
+            "INSERT INTO config(key,value) VALUES(?,?)",
+            (
+                ("notify.enabled", json.dumps(enabled)),
+                ("notify.webhook_type", "legacy-type"),
+                ("notify.webhook_url", endpoint),
+            ),
+        )
+    database, importer, secrets = _importer(target)
+    database.initialize()
+    importer.execute(vshop, auto, expected_counts=None)
+
+    with database.connect() as connection:
+        channel = connection.execute(
+            "SELECT enabled,endpoint_secret_id FROM notification_channels"
+        ).fetchone()
+        assert channel is not None
+        assert bool(channel["enabled"]) is enabled
+        assert channel["endpoint_secret_id"] == stable_id(
+            "autocheckin", "secret", "config:notify.webhook_url",
+        )
+    assert secrets.reveal(channel["endpoint_secret_id"]).decode() == endpoint
+    assert endpoint.encode() not in target.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ("file:///tmp/hook", "https://user:pass@hooks.test/notify", "not-a-url"),
+)
+def test_invalid_legacy_webhook_is_encrypted_but_not_activated(
+    tmp_path, endpoint: str,
+) -> None:
+    vshop, auto, target = tmp_path / "vshop.db", tmp_path / "auto.db", tmp_path / "target.db"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    with sqlite3.connect(auto) as connection:
+        connection.executemany(
+            "INSERT INTO config(key,value) VALUES(?,?)",
+            (
+                ("notify.enabled", "true"),
+                ("notify.webhook_url", endpoint),
+            ),
+        )
+    database, importer, _ = _importer(target)
+    database.initialize()
+    importer.execute(vshop, auto, expected_counts=None)
+
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM notification_channels"
+        ).fetchone()[0] == 0
+        stored = json.loads(connection.execute(
+            "SELECT value_json FROM settings WHERE key=?",
+            ("legacy.autocheckin.notify.webhook_url",),
+        ).fetchone()[0])
+        assert stored["valid_endpoint"] is False
+        assert stored["$secret_id"] == stable_id(
+            "autocheckin", "secret", "config:notify.webhook_url",
+        )
+    assert endpoint.encode() not in target.read_bytes()
+
+
 def _write_cutover_receipt(
     path: Path,
     *,
@@ -146,11 +334,35 @@ def _write_cutover_receipt(
     target: Path,
     profile_source: Path,
     profile_target: Path,
+    artifact_source: Path | None = None,
+    artifact_target: Path | None = None,
     issued_at: datetime | None = None,
     expires_at: datetime | None = None,
 ) -> Path:
     issued = issued_at or datetime.now(UTC)
     expires = expires_at or issued + timedelta(minutes=30)
+    artifact_source = artifact_source or path.parent / "legacy-artifacts"
+    artifact_target = artifact_target or path.parent / "copied-artifacts"
+    artifact_source.mkdir(parents=True, exist_ok=True)
+    profile_source.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(autocheckin) as connection:
+        references = [
+            (str(legacy_id), str(filename))
+            for legacy_id, filename in connection.execute(
+                """SELECT id,screenshot FROM logs
+                   WHERE trim(coalesce(screenshot,''))!='' ORDER BY id"""
+            )
+        ]
+    for legacy_id, filename in references:
+        candidate = artifact_source / filename
+        if not candidate.exists():
+            candidate.write_bytes(f"artifact-{legacy_id}".encode())
+    artifact_inventory = ArtifactCopier(
+        autocheckin, artifact_source, artifact_target
+    ).inventory()
+    profile_inventory = profile_inventory_summary(
+        ProfileCopier(profile_source, profile_target).inventory()
+    )
     document = {
         "kind": migrate_cli.RECEIPT_KIND,
         "version": migrate_cli.RECEIPT_VERSION,
@@ -170,6 +382,14 @@ def _write_cutover_receipt(
         "target_database": str(target.resolve()),
         "profile_source": str(profile_source.resolve()),
         "profile_target": str(profile_target.resolve()),
+        "profile_manifest": profile_inventory,
+        "artifact_source": str(artifact_source.resolve()),
+        "artifact_target": str(artifact_target.resolve()),
+        "artifact_manifest": {
+            "sha256": artifact_inventory.manifest_sha256,
+            "files": artifact_inventory.referenced_files,
+            "bytes": artifact_inventory.referenced_bytes,
+        },
     }
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
@@ -287,11 +507,22 @@ def test_profile_failure_preserves_bound_target_for_profiles_only_resume(
     _make_vshop(vshop)
     _make_auto(auto)
     profile_source.mkdir()
+    cookies = profile_source / "site-1" / "Default" / "Cookies"
+    cookies.parent.mkdir(parents=True)
+    cookies.write_bytes(b"profile-fixture")
     _write_cutover_receipt(
         receipt, vshop=vshop, autocheckin=auto, target=target,
         profile_source=profile_source, profile_target=profile_target,
     )
     _patch_cli_test_secrets(monkeypatch)
+    original_copy = LegacyImporter.copy_autocheckin_profiles
+
+    def fail_profiles(self, *args, **kwargs):
+        raise RuntimeError("forced Profile copy failure")
+
+    monkeypatch.setattr(
+        LegacyImporter, "copy_autocheckin_profiles", fail_profiles,
+    )
     full_args = _cli_apply_args(
         vshop=vshop, autocheckin=auto, target=target, receipt=receipt,
     ) + [
@@ -299,7 +530,7 @@ def test_profile_failure_preserves_bound_target_for_profiles_only_resume(
         "--profile-target", str(profile_target),
     ]
 
-    with pytest.raises(RuntimeError, match="does not exactly match"):
+    with pytest.raises(RuntimeError, match="forced Profile copy failure"):
         migrate_cli.main(full_args)
     assert target.is_file()
     with sqlite3.connect(target) as connection:
@@ -312,9 +543,9 @@ def test_profile_failure_preserves_bound_target_for_profiles_only_resume(
         ).fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM browser_profiles").fetchone()[0] == 0
 
-    cookies = profile_source / "site-1" / "Default" / "Cookies"
-    cookies.parent.mkdir(parents=True)
-    cookies.write_bytes(b"profile-fixture")
+    monkeypatch.setattr(
+        LegacyImporter, "copy_autocheckin_profiles", original_copy,
+    )
     resume_args = _cli_apply_args(vshop=vshop, autocheckin=auto, target=target) + [
         "--copy-profiles", "--profiles-only",
         "--profile-source", str(profile_source),
@@ -323,6 +554,258 @@ def test_profile_failure_preserves_bound_target_for_profiles_only_resume(
     assert migrate_cli.main(resume_args) == 0
     with sqlite3.connect(target) as connection:
         assert connection.execute("SELECT count(*) FROM browser_profiles").fetchone()[0] == 1
+
+
+def test_profile_source_change_after_receipt_is_rejected_before_target_write(tmp_path):
+    vshop, auto = tmp_path / "vshop.db", tmp_path / "auto.db"
+    target, receipt = tmp_path / "target.db", tmp_path / "receipt.json"
+    profile_source, profile_target = tmp_path / "profiles", tmp_path / "copied"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    profile_file = profile_source / "site-1" / "Default" / "Cookies"
+    profile_file.parent.mkdir(parents=True)
+    profile_file.write_bytes(b"before-preflight")
+    _write_cutover_receipt(
+        receipt, vshop=vshop, autocheckin=auto, target=target,
+        profile_source=profile_source, profile_target=profile_target,
+    )
+
+    profile_file.write_bytes(b"changed-after-preflight")
+    with pytest.raises(SystemExit, match="Profile source manifest changed"):
+        migrate_cli.main(_cli_apply_args(
+            vshop=vshop, autocheckin=auto, target=target, receipt=receipt,
+        ))
+    assert not target.exists()
+
+
+def test_profile_source_change_is_rejected_before_profiles_only_resume_write(
+    tmp_path, monkeypatch,
+):
+    vshop, auto = tmp_path / "vshop.db", tmp_path / "auto.db"
+    target, receipt = tmp_path / "target.db", tmp_path / "receipt.json"
+    profile_source, profile_target = tmp_path / "profiles", tmp_path / "copied"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    profile_file = profile_source / "site-1" / "Default" / "Cookies"
+    profile_file.parent.mkdir(parents=True)
+    profile_file.write_bytes(b"receipt-bound")
+    _write_cutover_receipt(
+        receipt, vshop=vshop, autocheckin=auto, target=target,
+        profile_source=profile_source, profile_target=profile_target,
+    )
+    _patch_cli_test_secrets(monkeypatch)
+    assert migrate_cli.main(_cli_apply_args(
+        vshop=vshop, autocheckin=auto, target=target, receipt=receipt,
+    )) == 0
+
+    profile_file.write_bytes(b"drifted-before-resume")
+    resume_args = _cli_apply_args(
+        vshop=vshop, autocheckin=auto, target=target,
+    ) + [
+        "--copy-profiles", "--profiles-only",
+        "--profile-source", str(profile_source),
+        "--profile-target", str(profile_target),
+    ]
+    with pytest.raises(SystemExit, match="Profile source manifest changed"):
+        migrate_cli.main(resume_args)
+    assert not profile_target.exists()
+    with sqlite3.connect(target) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM browser_profiles"
+        ).fetchone()[0] == 0
+
+
+def test_artifact_copier_binds_verified_metadata_and_is_idempotent(tmp_path):
+    vshop, auto, target = tmp_path / "vshop.db", tmp_path / "auto.db", tmp_path / "target.db"
+    source_root, target_root = tmp_path / "legacy-artifacts", tmp_path / "artifacts"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    source_root.mkdir()
+    payload = b"\x89PNG\r\n\x1a\nverified-screenshot"
+    (source_root / "one.png").write_bytes(payload)
+    (source_root / "unreferenced.png").write_bytes(b"not-imported")
+
+    database, importer, _ = _importer(target)
+    database.initialize()
+    importer.execute(vshop, auto, expected_counts=None)
+
+    inventory = ArtifactCopier(auto, source_root, target_root).inventory()
+    assert inventory.referenced_files == 1
+    assert inventory.referenced_bytes == len(payload)
+    assert inventory.unreferenced_files == 1
+    assert inventory.unreferenced_bytes == len(b"not-imported")
+    with pytest.raises(RuntimeError, match="manifest changed"):
+        importer.copy_autocheckin_artifacts(
+            auto, source_root, target_root, expected_manifest="0" * 64,
+        )
+    assert not target_root.exists()
+
+    counts = importer.copy_autocheckin_artifacts(
+        auto, source_root, target_root,
+        expected_manifest=inventory.manifest_sha256,
+    )
+    assert counts == {
+        "artifacts": 1,
+        "files": 1,
+        "bytes": len(payload),
+        "unreferenced_files": 1,
+        "unreferenced_bytes": len(b"not-imported"),
+    }
+    destination = target_root / "legacy" / "autocheckin" / "one.png"
+    assert destination.read_bytes() == payload
+    assert not (target_root / "legacy" / "autocheckin" / "unreferenced.png").exists()
+    digest = hashlib.sha256(payload).hexdigest()
+    with database.connect() as connection:
+        artifact = connection.execute(
+            "SELECT * FROM artifacts WHERE id=?",
+            (stable_id("autocheckin", "artifact", 1),),
+        ).fetchone()
+        assert artifact["relative_path"] == "legacy/autocheckin/one.png"
+        assert artifact["sha256"] == digest
+        assert artifact["size"] == len(payload)
+        assert artifact["mime_type"] == "image/png"
+        assert connection.execute(
+            """SELECT source_fingerprint FROM legacy_map
+               WHERE source='autocheckin' AND entity_type='artifact' AND legacy_id='1'"""
+        ).fetchone()[0] == digest
+
+    assert importer.copy_autocheckin_artifacts(
+        auto, source_root, target_root,
+        expected_manifest=inventory.manifest_sha256,
+    ) == counts
+    destination.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        importer.copy_autocheckin_artifacts(
+            auto, source_root, target_root,
+            expected_manifest=inventory.manifest_sha256,
+        )
+
+
+def test_artifact_inventory_rejects_unsafe_and_casefold_duplicate_references(tmp_path):
+    auto = tmp_path / "auto.db"
+    source_root, target_root = tmp_path / "legacy-artifacts", tmp_path / "artifacts"
+    _make_auto(auto)
+    source_root.mkdir()
+    (source_root / "one.png").write_bytes(b"one")
+    with sqlite3.connect(auto) as connection:
+        connection.execute("UPDATE logs SET screenshot='../escape.png' WHERE id=1")
+    with pytest.raises(RuntimeError, match="safe flat filename"):
+        ArtifactCopier(auto, source_root, target_root).inventory()
+
+    with sqlite3.connect(auto) as connection:
+        connection.execute("UPDATE logs SET screenshot='one.png' WHERE id=1")
+        connection.execute(
+            """INSERT INTO logs(id,site_id,status,message,screenshot,duration_ms,created_at)
+               VALUES(2,1,'success','','ONE.PNG',1,'2026-01-02T08:00:00Z')"""
+        )
+    with pytest.raises(RuntimeError, match="duplicate filenames"):
+        ArtifactCopier(auto, source_root, target_root).inventory()
+
+
+def test_artifact_failure_preserves_bound_target_for_artifacts_only_resume(
+    tmp_path, monkeypatch,
+):
+    vshop, auto = tmp_path / "vshop.db", tmp_path / "auto.db"
+    target, receipt = tmp_path / "target.db", tmp_path / "receipt.json"
+    profile_source, profile_target = tmp_path / "profiles", tmp_path / "profiles-copy"
+    artifact_source, artifact_target = tmp_path / "legacy-artifacts", tmp_path / "artifacts"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    profile_source.mkdir()
+    artifact_source.mkdir()
+    (artifact_source / "one.png").write_bytes(b"artifact-fixture")
+    _write_cutover_receipt(
+        receipt, vshop=vshop, autocheckin=auto, target=target,
+        profile_source=profile_source, profile_target=profile_target,
+        artifact_source=artifact_source, artifact_target=artifact_target,
+    )
+    _patch_cli_test_secrets(monkeypatch)
+    original_copy = LegacyImporter.copy_autocheckin_artifacts
+
+    def fail_artifacts(self, *args, **kwargs):
+        raise RuntimeError("forced artifact copy failure")
+
+    monkeypatch.setattr(LegacyImporter, "copy_autocheckin_artifacts", fail_artifacts)
+    full_args = _cli_apply_args(
+        vshop=vshop, autocheckin=auto, target=target, receipt=receipt,
+    ) + [
+        "--copy-artifacts", "--artifact-source", str(artifact_source),
+        "--artifact-target", str(artifact_target),
+    ]
+    with pytest.raises(RuntimeError, match="forced artifact copy failure"):
+        migrate_cli.main(full_args)
+    assert target.is_file()
+    with sqlite3.connect(target) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM migration_runs WHERE status='succeeded'"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM settings WHERE key=?",
+            (migrate_cli.RECEIPT_BINDING_SETTING,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM artifacts WHERE sha256 IS NOT NULL"
+        ).fetchone()[0] == 0
+
+    monkeypatch.setattr(LegacyImporter, "copy_autocheckin_artifacts", original_copy)
+    resume_args = _cli_apply_args(vshop=vshop, autocheckin=auto, target=target) + [
+        "--copy-artifacts", "--artifacts-only",
+        "--artifact-source", str(artifact_source),
+        "--artifact-target", str(artifact_target),
+    ]
+    assert migrate_cli.main(resume_args) == 0
+    with sqlite3.connect(target) as connection:
+        artifact = connection.execute(
+            "SELECT relative_path,sha256,size,mime_type FROM artifacts"
+        ).fetchone()
+        assert artifact[0] == "legacy/autocheckin/one.png"
+        assert len(artifact[1]) == 64
+        assert artifact[2] == len(b"artifact-fixture")
+        assert artifact[3] == "image/png"
+
+
+def test_artifact_source_change_after_receipt_is_rejected_before_target_write(tmp_path):
+    vshop, auto = tmp_path / "vshop.db", tmp_path / "auto.db"
+    target, receipt = tmp_path / "target.db", tmp_path / "receipt.json"
+    profile_source, profile_target = tmp_path / "profiles", tmp_path / "profiles-copy"
+    artifact_source, artifact_target = tmp_path / "legacy-artifacts", tmp_path / "artifacts"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    profile_source.mkdir()
+    artifact_source.mkdir()
+    screenshot = artifact_source / "one.png"
+    screenshot.write_bytes(b"before-preflight")
+    _write_cutover_receipt(
+        receipt, vshop=vshop, autocheckin=auto, target=target,
+        profile_source=profile_source, profile_target=profile_target,
+        artifact_source=artifact_source, artifact_target=artifact_target,
+    )
+    screenshot.write_bytes(b"after-preflight")
+    with pytest.raises(SystemExit, match="artifact source manifest changed"):
+        migrate_cli.main(_cli_apply_args(
+            vshop=vshop, autocheckin=auto, target=target, receipt=receipt,
+        ))
+    assert not target.exists()
+
+
+def test_analyze_reports_artifact_inventory_without_creating_target(tmp_path, capsys):
+    vshop, auto, target = tmp_path / "vshop.db", tmp_path / "auto.db", tmp_path / "target.db"
+    artifact_source = tmp_path / "legacy-artifacts"
+    _make_vshop(vshop)
+    _make_auto(auto)
+    artifact_source.mkdir()
+    (artifact_source / "one.png").write_bytes(b"artifact")
+    (artifact_source / "orphan.png").write_bytes(b"orphan")
+    assert migrate_cli.main([
+        "analyze", "--vshop-db", str(vshop), "--autocheckin-db", str(auto),
+        "--target-db", str(target), "--allow-count-drift",
+        "--include-artifact-inventory", "--artifact-source", str(artifact_source),
+    ]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["artifacts"]["referenced_files"] == 1
+    assert output["artifacts"]["referenced_bytes"] == len(b"artifact")
+    assert output["artifacts"]["unreferenced_files"] == 1
+    assert not target.exists()
 
 
 def test_full_fixture_import_encrypts_sensitive_values_and_maps_entities(tmp_path):
@@ -347,14 +830,36 @@ def test_full_fixture_import_encrypts_sensitive_values_and_maps_entities(tmp_pat
             (stable_id("vshop", "site", 1),),
         ).fetchone()
         assert "?" not in row["url_base"] and "#" not in row["url_base"]
+        assert row["url_suffix_secret_id"] == stable_id(
+            "vshop", "secret", "site:1:url_suffix",
+        )
         restored = restore_sensitive_url(row["url_base"], row["url_suffix_secret_id"], secrets)
         assert restored == "https://shop.test/path?token=fake-url-secret#view"
-        config = connection.execute(
-            """SELECT config_json FROM capability_instances
+        product_url = connection.execute(
+            """SELECT buy_url_base,buy_url_suffix_secret_id FROM products
+               WHERE id=?""",
+            (stable_id("vshop", "product", 1),),
+        ).fetchone()
+        assert product_url["buy_url_suffix_secret_id"] == stable_id(
+            "vshop", "secret", "product:1:buy_url_suffix",
+        )
+        auto_endpoint = connection.execute(
+            """SELECT url_suffix_secret_id FROM site_endpoints
+               WHERE site_id=?""",
+            (stable_id("autocheckin", "site", 1),),
+        ).fetchone()
+        assert auto_endpoint["url_suffix_secret_id"] == stable_id(
+            "autocheckin", "secret", "site:1:url_suffix",
+        )
+        capability = connection.execute(
+            """SELECT adapter,config_json FROM capability_instances
                WHERE site_id=? AND code='checkin'""",
             (stable_id("autocheckin", "site", 1),),
-        ).fetchone()[0]
+        ).fetchone()
+        assert capability["adapter"] == "cookie"
+        config = capability["config_json"]
         assert "fake-cookie-secret" not in config
+        assert '"adapter"' not in config
         assert '"_secret_fields":["cookie"]' in config
         capability_id = stable_id("autocheckin", "capability-checkin", 1)
         account_id = stable_id("autocheckin", "account", 1)
@@ -369,6 +874,18 @@ def test_full_fixture_import_encrypts_sensitive_values_and_maps_entities(tmp_pat
             (account_id,),
         ).fetchone()[0]
         assert capability_ref == account_ref
+        checkin_schedule = connection.execute(
+            """SELECT s.* FROM schedules s
+               JOIN capability_instances c ON c.id=s.capability_instance_id
+               WHERE c.account_id=? AND c.code='checkin'""",
+            (account_id,),
+        ).fetchone()
+        assert checkin_schedule is not None
+        assert checkin_schedule["policy_type"] == "daily_random_window"
+        assert json.loads(checkin_schedule["policy_json"]) == {}
+        assert checkin_schedule["enabled"] == 0
+        assert checkin_schedule["next_run_at"] is None
+        assert checkin_schedule["max_attempts"] == 3
         product_schedule = connection.execute(
             """SELECT s.* FROM schedules s
                JOIN capability_instances c ON c.id=s.capability_instance_id
@@ -522,6 +1039,38 @@ def test_sqlite_backup_api_and_profile_copy_manifest(tmp_path):
     assert not (destination / "SingletonLock").exists()
 
 
+def test_profile_copier_rejects_bidirectional_tree_overlap(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    with pytest.raises(ValueError, match="must not overlap"):
+        ProfileCopier(source, source / "target")
+
+    target = tmp_path / "target"
+    nested_source = target / "source"
+    nested_source.mkdir(parents=True)
+    with pytest.raises(ValueError, match="must not overlap"):
+        ProfileCopier(nested_source, target)
+
+
+@pytest.mark.parametrize("tree_name", ("source", "target"))
+def test_profile_copier_rejects_reparse_points(
+    tmp_path, monkeypatch, tree_name: str,
+) -> None:
+    source, target = tmp_path / "source", tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    marker = (source if tree_name == "source" else target) / "reparse-marker"
+    marker.mkdir()
+    real_check = legacy_import_module._is_reparse_point
+    monkeypatch.setattr(
+        legacy_import_module,
+        "_is_reparse_point",
+        lambda path: path.name == "reparse-marker" or real_check(path),
+    )
+    with pytest.raises(ValueError, match="reparse point"):
+        ProfileCopier(source, target)
+
+
 @pytest.mark.integration
 def test_real_frozen_database_backup_rehearsal(tmp_path):
     vshop_source = Path(
@@ -581,7 +1130,43 @@ def test_real_frozen_database_backup_rehearsal(tmp_path):
         ).fetchone()[0]
         assert product_capabilities == 24
         assert product_schedules == product_capabilities
-        assert connection.execute("SELECT count(*) FROM legacy_map").fetchone()[0] == 691
+        checkin_schedules = connection.execute(
+            """SELECT count(*) FROM schedules s
+               JOIN capability_instances c ON c.id=s.capability_instance_id
+               WHERE c.code='checkin' AND s.timezone='Asia/Shanghai'
+                 AND s.policy_type='daily_random_window' AND s.policy_json='{}'
+                 AND s.enabled=0 AND s.next_run_at IS NULL AND s.max_attempts=3"""
+        ).fetchone()[0]
+        assert checkin_schedules == 9
+        imported_adapters = {
+            str(legacy_id): str(adapter)
+            for legacy_id, adapter in connection.execute(
+                """SELECT m.legacy_id,c.adapter
+                   FROM legacy_map m
+                   JOIN site_accounts a ON a.id=m.new_id
+                   JOIN capability_instances c
+                     ON c.account_id=a.id AND c.code='checkin'
+                   WHERE m.source='autocheckin' AND m.entity_type='account'"""
+            )
+        }
+        assert imported_adapters == {
+            "1": "nodeloc",
+            "2": "playwright-generic",
+            "3": "nodeseek",
+            "4": "btschool",
+            "5": "jianzhile",
+            "6": "xkool",
+            "7": "hundredxlabs",
+            "8": "api123nhh",
+            "9": "52pojie",
+        }
+        # The frozen source has notifications disabled, an empty webhook URL,
+        # and only a legacy webhook type selector.  It must not manufacture a
+        # channel or its legacy mapping.
+        assert connection.execute(
+            "SELECT count(*) FROM notification_channels"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM legacy_map").fetchone()[0] == 690
         for source_name, legacy_id, source_url in source_urls:
             endpoint = connection.execute(
                 """SELECT e.url_base,e.url_suffix_secret_id
@@ -614,4 +1199,24 @@ def test_real_autocheckin_profile_inventory_is_frozen() -> None:
     assert sum(item.total_bytes for item in inventory.values()) == 1_254_631_644
     assert aggregate.hexdigest() == (
         "4666bdc971199c470a18141e2263d2046da0bb01aacb3a84709d81318a2b0919"
+    )
+
+
+@pytest.mark.integration
+def test_real_autocheckin_artifact_inventory_is_frozen(tmp_path) -> None:
+    auto_source = Path(r"E:\myprojects\auto-checkin-hub\data\checkin.db")
+    artifact_source = Path(r"E:\myprojects\auto-checkin-hub\data\screenshots")
+    if not auto_source.is_file() or not artifact_source.is_dir():
+        pytest.skip("audited AutoCheckin screenshots are unavailable")
+    auto_copy = tmp_path / "auto.copy.db"
+    backup_sqlite_database(auto_source, auto_copy)
+    inventory = ArtifactCopier(
+        auto_copy, artifact_source, tmp_path / "unused-artifact-target"
+    ).inventory()
+    assert inventory.referenced_files == 83
+    assert inventory.referenced_bytes == 21_648_632
+    assert inventory.unreferenced_files == 8
+    assert inventory.unreferenced_bytes == 1_772_179
+    assert inventory.manifest_sha256 == (
+        "764763f9e8cf8e1f39f2d755ca97ddc070cd037300fd1484553fb77d112cbe60"
     )

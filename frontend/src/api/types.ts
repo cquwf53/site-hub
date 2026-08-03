@@ -67,7 +67,7 @@ export interface Site {
   configured_secret_fields?: string[]
 }
 
-export type AuthState = 'not_configured' | 'opening' | 'awaiting_user' | 'verifying' | 'ready' | 'expired' | 'error'
+export type AuthState = 'not_configured' | 'unverified' | 'opening' | 'awaiting_user' | 'verifying' | 'ready' | 'expired' | 'error'
 
 export interface SiteAccount {
   id: ID
@@ -170,6 +170,7 @@ export interface Job {
   attempt?: number
   max_attempts?: number
   message?: string | null
+  error_message?: string | null
   progress?: number | null
   created_at?: string
   updated_at?: string

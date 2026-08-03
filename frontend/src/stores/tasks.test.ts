@@ -2,14 +2,19 @@ import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useTaskStore } from './tasks'
 
+let taskEvent: EventListener | null = null
+
 describe('task store', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
+    taskEvent = null
     vi.stubGlobal('EventSource', class {
       onopen = null
       onmessage = null
       onerror = null
-      addEventListener() {}
+      addEventListener(type: string, listener: EventListener) {
+        if (type === 'task') taskEvent = listener
+      }
       close() {}
     })
   })
@@ -28,5 +33,20 @@ describe('task store', () => {
     store.track({ jobId: 'leased-job', status: 'leased', deduplicated: false })
     store.track({ jobId: 'unknown-job', status: 'effect_unknown', deduplicated: false })
     expect(store.activeCount).toBe(1)
+  })
+
+  it('shows the API error_message when a task fails', () => {
+    const store = useTaskStore()
+    store.track({ jobId: 'failed-job', status: 'running', deduplicated: false })
+
+    taskEvent?.(new MessageEvent('task', {
+      data: JSON.stringify({
+        id: 'failed-job', status: 'failed', error_message: 'Profile verification timed out',
+      }),
+    }))
+
+    expect(store.tasks[0]).toMatchObject({
+      id: 'failed-job', status: 'failed', message: 'Profile verification timed out',
+    })
   })
 })

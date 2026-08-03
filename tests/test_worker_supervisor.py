@@ -78,6 +78,14 @@ class RecordingPeer:
         return {"accepted": True}
 
 
+class RecordingEvents:
+    def __init__(self) -> None:
+        self.published: list[tuple[str, dict]] = []
+
+    async def publish(self, topic: str, payload: dict) -> None:
+        self.published.append((topic, payload))
+
+
 def _bare_supervisor(jobs: JobService, tmp_path: Path, peer: RecordingPeer):
     profiles = tmp_path / "profiles"; profiles.mkdir(exist_ok=True)
     artifacts = tmp_path / "artifacts"; artifacts.mkdir(exist_ok=True)
@@ -89,6 +97,59 @@ def _bare_supervisor(jobs: JobService, tmp_path: Path, peer: RecordingPeer):
     supervisor._peer = peer
     supervisor._ready.set()
     return supervisor
+
+
+@pytest.mark.asyncio
+async def test_profile_verification_uses_dedicated_read_only_worker_rpc(tmp_path):
+    store = MemoryStore()
+    site = await store.create_site({
+        "name": "Site", "url": "https://example.test/account", "status": "active",
+    })
+    account = await store.create_account(UUID(str(site["id"])), {
+        "name": "Primary", "adapter": "worker-adapter", "enabled": False,
+    })
+    peer = RecordingPeer()
+    supervisor = _bare_supervisor(JobService(store, EventBroker()), tmp_path, peer)
+
+    await supervisor.verify_session(UUID(str(account["id"])))
+
+    method, params = peer.calls[-1]
+    assert method == "session.verify"
+    assert params["accountId"] == str(account["id"])
+    assert params["site"]["url"] == "https://example.test/account"
+    assert Path(params["profileDir"]).resolve().parent == (tmp_path / "profiles").resolve()
+
+
+@pytest.mark.asyncio
+async def test_session_event_is_resanitized_before_persist_and_publish(tmp_path):
+    store = MemoryStore()
+    site = await store.create_site({
+        "name": "Site", "url": "https://example.test/account", "status": "active",
+    })
+    account = await store.create_account(UUID(str(site["id"])), {
+        "name": "Primary", "adapter": "worker-adapter", "enabled": False,
+    })
+    events = RecordingEvents()
+    supervisor = _bare_supervisor(JobService(store, events), tmp_path, RecordingPeer())
+
+    result = await supervisor._on_session_event({
+        "accountId": str(account["id"]),
+        "action": "login_complete",
+        "state": "error",
+        "currentUrl": "https://user:pass@example.test/account?token=url-secret#fragment",
+        "error": "token=message-secret at https://example.test/?token=url-secret",
+    })
+
+    assert result == {"accepted": True}
+    persisted = await store.get_account(UUID(str(account["id"])))
+    assert persisted and persisted["profile"]["state"] == "error"
+    assert "message-secret" not in str(persisted["profile"]["verification_error"])
+    topic, event = events.published[-1]
+    assert topic == "session"
+    assert event["currentUrl"] == "https://example.test/account"
+    assert "?" not in event["currentUrl"] and "#" not in event["currentUrl"]
+    assert "message-secret" not in str(event["error"])
+    assert "url-secret" not in str(event)
 
 
 @pytest.mark.asyncio

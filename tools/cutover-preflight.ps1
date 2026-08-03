@@ -5,6 +5,7 @@ param(
     [string]$VShopDatabase = '',
     [string]$AutoCheckinDatabase = '',
     [string]$ProfileSource = '',
+    [string]$ArtifactSource = '',
     [string]$TargetData = '',
     [string]$LegacyTaskName = 'AutoCheckin Hub',
     [string]$SiteHubTaskName = 'SiteHub',
@@ -23,16 +24,24 @@ $AutoCheckinProject = [System.IO.Path]::GetFullPath($AutoCheckinProject)
 if (-not $VShopDatabase) { $VShopDatabase = Join-Path $VShopProject 'data\vshop.db' }
 if (-not $AutoCheckinDatabase) { $AutoCheckinDatabase = Join-Path $AutoCheckinProject 'data\checkin.db' }
 if (-not $ProfileSource) { $ProfileSource = Join-Path $AutoCheckinProject 'data\browser-profiles' }
+if (-not $ArtifactSource) { $ArtifactSource = Join-Path $AutoCheckinProject 'data\screenshots' }
 if (-not $TargetData) { $TargetData = Join-Path $SiteHubProject 'data' }
 $VShopDatabase = [System.IO.Path]::GetFullPath($VShopDatabase)
 $AutoCheckinDatabase = [System.IO.Path]::GetFullPath($AutoCheckinDatabase)
 $ProfileSource = [System.IO.Path]::GetFullPath($ProfileSource)
+$ArtifactSource = [System.IO.Path]::GetFullPath($ArtifactSource)
 $TargetData = [System.IO.Path]::GetFullPath($TargetData)
 $defaultTargetData = [System.IO.Path]::GetFullPath((Join-Path $SiteHubProject 'data'))
 $targetDatabase = Join-Path $TargetData 'site-hub.db'
 $targetProfiles = Join-Path $TargetData 'browser-profiles'
+$targetArtifacts = Join-Path $TargetData 'artifacts'
+$venvPython = Join-Path $SiteHubProject '.venv\Scripts\python.exe'
+$probeScript = Join-Path $SiteHubProject 'tools\preflight_probe.py'
 $profileBytes = [int64]0
 $profileInventoryAvailable = $false
+$profileInventory = $null
+$artifactBytes = [int64]0
+$artifactInventory = $null
 $receiptFullPath = if ([string]::IsNullOrWhiteSpace($ReceiptPath)) {
     ''
 } else {
@@ -212,6 +221,7 @@ Write-Host "SiteHub cutover preflight ($preflightMode)" -ForegroundColor Cyan
 Write-Host "SiteHub project : $SiteHubProject"
 Write-Host "VShop project  : $VShopProject"
 Write-Host "AutoCheckin    : $AutoCheckinProject"
+Write-Host "Legacy artifacts: $ArtifactSource"
 Write-Host "Target data    : $TargetData"
 Write-Host ''
 
@@ -281,18 +291,73 @@ if (Test-Path -LiteralPath $ProfileSource -PathType Container) {
         Add-Result 'PASS' 'Browser profiles' "No top-level Chromium singleton/DevTools lock markers found: $ProfileSource"
     }
     if (-not $SkipProfileInventory) {
-        $files = @(Get-ChildItem -LiteralPath $ProfileSource -Recurse -Force -File -ErrorAction SilentlyContinue)
-        $bytes = ($files | Measure-Object -Property Length -Sum).Sum
-        if ($null -eq $bytes) { $bytes = 0 }
-        $profileBytes = [int64]$bytes
-        $profileInventoryAvailable = $true
-        $profiles = @(Get-ChildItem -LiteralPath $ProfileSource -Directory -Force -ErrorAction SilentlyContinue)
-        Add-Result 'PASS' 'Profile inventory' "profiles=$($profiles.Count); files=$($files.Count); bytes=$bytes"
+        if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $probeScript -PathType Leaf)) {
+            Add-Result 'BLOCK' 'Profile inventory' 'Python environment or preflight probe is unavailable for the hash-bound Profile inventory.'
+        } else {
+            try {
+                $profileOutput = @(& $venvPython $probeScript legacy-profiles $ProfileSource $targetProfiles 2>$null)
+                if ($LASTEXITCODE -ne 0 -or $profileOutput.Count -eq 0) {
+                    throw 'Profile inventory probe returned no valid result'
+                }
+                $profileInventory = $profileOutput[-1] | ConvertFrom-Json
+                $profileBytes = [int64]$profileInventory.bytes
+                $profileInventoryAvailable = $true
+                Add-Result 'PASS' 'Profile inventory' (
+                    "profiles=$($profileInventory.profiles); files=$($profileInventory.files); " +
+                    "bytes=$($profileInventory.bytes); sha256=$($profileInventory.sha256)"
+                )
+            } catch {
+                Add-Result 'BLOCK' 'Profile inventory' "Unable to build the Profile manifest: $($_.Exception.Message)"
+            }
+        }
     } else {
-        Add-Result 'WARN' 'Profile inventory' 'Skipped by -SkipProfileInventory.'
+        if ($receiptFullPath) {
+            Add-Result 'BLOCK' 'Profile inventory' 'A receipt cannot be generated with -SkipProfileInventory because receipt v2 must bind the Profile manifest.'
+        } else {
+            Add-Result 'WARN' 'Profile inventory' 'Skipped by -SkipProfileInventory.'
+        }
     }
 } else {
     Add-Result 'BLOCK' 'Browser profiles' "Profile source is missing: $ProfileSource"
+}
+
+if (-not (Test-Path -LiteralPath $ArtifactSource -PathType Container)) {
+    Add-Result 'BLOCK' 'Legacy artifacts' "Screenshot source is missing: $ArtifactSource"
+} elseif (-not (Test-Path -LiteralPath $venvPython -PathType Leaf) -or
+          -not (Test-Path -LiteralPath $probeScript -PathType Leaf)) {
+    Add-Result 'BLOCK' 'Legacy artifacts' 'Python environment or preflight probe is unavailable for screenshot inventory.'
+} else {
+    try {
+        $artifactOutput = @(& $venvPython $probeScript legacy-artifacts $AutoCheckinDatabase $ArtifactSource 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $artifactOutput.Count -eq 0) {
+            throw 'artifact inventory probe returned no valid result'
+        }
+        $artifactInventory = $artifactOutput[-1] | ConvertFrom-Json
+        $artifactBytes = [int64]$artifactInventory.referenced_bytes
+        $artifactProblems = [int]$artifactInventory.missing_files +
+            [int]$artifactInventory.unsafe_references +
+            [int]$artifactInventory.duplicate_references
+        if ($artifactProblems -gt 0) {
+            Add-Result 'BLOCK' 'Legacy artifacts' (
+                "referenced=$($artifactInventory.referenced_files); missing=$($artifactInventory.missing_files); " +
+                "unsafe=$($artifactInventory.unsafe_references); duplicates=$($artifactInventory.duplicate_references)"
+            )
+        } else {
+            Add-Result 'PASS' 'Legacy artifacts' (
+                "referenced=$($artifactInventory.referenced_files); bytes=$($artifactInventory.referenced_bytes); " +
+                "manifest_sha256=$($artifactInventory.manifest_sha256)"
+            )
+        }
+        if ([int]$artifactInventory.unreferenced_files -gt 0) {
+            Add-Result 'WARN' 'Unreferenced legacy artifacts' (
+                "files=$($artifactInventory.unreferenced_files); bytes=$($artifactInventory.unreferenced_bytes); " +
+                'these files will remain only in the read-only legacy archive'
+            )
+        }
+    } catch {
+        Add-Result 'BLOCK' 'Legacy artifacts' "Unable to inventory referenced screenshots: $($_.Exception.Message)"
+    }
 }
 
 $legacyLock = Join-Path $AutoCheckinProject 'data\auto-checkin-hub.lock'
@@ -413,7 +478,9 @@ if ($profileInventoryAvailable) {
                 $sourceDbBytes += [int64](Get-Item -LiteralPath $sourceDb).Length
             }
         }
-        $requiredBytes = [int64][Math]::Ceiling($profileBytes * 1.25 + $sourceDbBytes * 3 + 512MB)
+        $requiredBytes = [int64][Math]::Ceiling(
+            $profileBytes * 1.25 + $artifactBytes * 1.25 + $sourceDbBytes * 3 + 512MB
+        )
         $driveRoot = [System.IO.Path]::GetPathRoot($TargetData)
         $drive = New-Object System.IO.DriveInfo -ArgumentList $driveRoot
         if ($drive.AvailableFreeSpace -ge $requiredBytes) {
@@ -476,7 +543,6 @@ if ($null -eq $node) {
     }
 }
 
-$venvPython = Join-Path $SiteHubProject '.venv\Scripts\python.exe'
 if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
     & $venvPython -c 'import fastapi,uvicorn,httpx,bs4,lxml,apscheduler,aiosqlite,playwright,ddddocr,psutil,pydantic,multipart' *> $null
     if ($LASTEXITCODE -eq 0) {
@@ -490,7 +556,6 @@ if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
 
 if ((Test-Path -LiteralPath $venvPython -PathType Leaf) -and
     (Test-Path -LiteralPath $AutoCheckinDatabase -PathType Leaf)) {
-    $probeScript = Join-Path $SiteHubProject 'tools\preflight_probe.py'
     $nonterminal = @(& $venvPython $probeScript legacy-nonterminal $AutoCheckinDatabase 2>$null)
     if ($LASTEXITCODE -ne 0 -or $nonterminal.Count -eq 0) {
         Add-Result 'BLOCK' 'Legacy nonterminal jobs' 'Unable to inspect AutoCheckin batch and batch-item state.'
@@ -512,7 +577,7 @@ if ($receiptFullPath) {
             $expiresAt = $issuedAt.AddMinutes($ReceiptTtlMinutes)
             $receipt = [ordered]@{
                 kind = 'sitehub-cutover-preflight'
-                version = 1
+                version = 2
                 issued_at = $issuedAt.ToString('o')
                 expires_at = $expiresAt.ToString('o')
                 sitehub_project = $SiteHubProject
@@ -529,6 +594,19 @@ if ($receiptFullPath) {
                 target_database = $targetDatabase
                 profile_source = $ProfileSource
                 profile_target = $targetProfiles
+                profile_manifest = [ordered]@{
+                    sha256 = [string]$profileInventory.sha256
+                    profiles = [int]$profileInventory.profiles
+                    files = [int]$profileInventory.files
+                    bytes = [int64]$profileInventory.bytes
+                }
+                artifact_source = $ArtifactSource
+                artifact_target = $targetArtifacts
+                artifact_manifest = [ordered]@{
+                    sha256 = [string]$artifactInventory.manifest_sha256
+                    files = [int]$artifactInventory.referenced_files
+                    bytes = [int64]$artifactInventory.referenced_bytes
+                }
             }
             $receiptJson = $receipt | ConvertTo-Json -Depth 6
             [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($receiptFullPath))
@@ -569,13 +647,13 @@ $suggestedReceipt = if ($receiptFullPath) {
     Join-Path $SiteHubProject '.runtime-state\cutover-receipt.json'
 }
 Write-Host "1. Re-run this preflight after resolving every blocker:"
-Write-Host "   powershell -NoProfile -ExecutionPolicy Bypass -File `"$SiteHubProject\tools\cutover-preflight.ps1`" -SiteHubProject `"$SiteHubProject`" -VShopProject `"$VShopProject`" -AutoCheckinProject `"$AutoCheckinProject`" -TargetData `"$TargetData`" -ReceiptPath `"$suggestedReceipt`""
+Write-Host "   powershell -NoProfile -ExecutionPolicy Bypass -File `"$SiteHubProject\tools\cutover-preflight.ps1`" -SiteHubProject `"$SiteHubProject`" -VShopProject `"$VShopProject`" -AutoCheckinProject `"$AutoCheckinProject`" -VShopDatabase `"$VShopDatabase`" -AutoCheckinDatabase `"$AutoCheckinDatabase`" -ProfileSource `"$ProfileSource`" -ArtifactSource `"$ArtifactSource`" -TargetData `"$TargetData`" -ReceiptPath `"$suggestedReceipt`""
 Write-Host '2. Read-only migration analysis:'
-Write-Host "   & `"$venvPython`" `"$SiteHubProject\tools\migrate_legacy.py`" analyze --vshop-db `"$VShopDatabase`" --autocheckin-db `"$AutoCheckinDatabase`" --include-profile-inventory --profile-source `"$ProfileSource`""
+Write-Host "   & `"$venvPython`" `"$SiteHubProject\tools\migrate_legacy.py`" analyze --vshop-db `"$VShopDatabase`" --autocheckin-db `"$AutoCheckinDatabase`" --include-profile-inventory --profile-source `"$ProfileSource`" --include-artifact-inventory --artifact-source `"$ArtifactSource`""
 Write-Host '3. Full disposable rehearsal:'
-Write-Host "   & `"$venvPython`" `"$SiteHubProject\tools\migrate_legacy.py`" dry-run --vshop-db `"$VShopDatabase`" --autocheckin-db `"$AutoCheckinDatabase`" --target-db `"$targetDatabase`" --include-profile-inventory --profile-source `"$ProfileSource`""
+Write-Host "   & `"$venvPython`" `"$SiteHubProject\tools\migrate_legacy.py`" dry-run --vshop-db `"$VShopDatabase`" --autocheckin-db `"$AutoCheckinDatabase`" --target-db `"$targetDatabase`" --include-profile-inventory --profile-source `"$ProfileSource`" --include-artifact-inventory --artifact-source `"$ArtifactSource`""
 Write-Host '4. Formal apply (ONLY after freeze, approvals, clean preflight, and successful rehearsal):'
-Write-Host "   & `"$venvPython`" `"$SiteHubProject\tools\migrate_legacy.py`" apply --vshop-db `"$VShopDatabase`" --autocheckin-db `"$AutoCheckinDatabase`" --target-db `"$targetDatabase`" --preflight-receipt `"$suggestedReceipt`" --copy-profiles --profile-source `"$ProfileSource`" --profile-target `"$targetProfiles`""
+Write-Host "   & `"$venvPython`" `"$SiteHubProject\tools\migrate_legacy.py`" apply --vshop-db `"$VShopDatabase`" --autocheckin-db `"$AutoCheckinDatabase`" --target-db `"$targetDatabase`" --preflight-receipt `"$suggestedReceipt`" --copy-artifacts --artifact-source `"$ArtifactSource`" --artifact-target `"$targetArtifacts`" --copy-profiles --profile-source `"$ProfileSource`" --profile-target `"$targetProfiles`""
 Write-Host '5. Windows acceptance before enabling the new schedule/task:'
 Write-Host "   powershell -NoProfile -ExecutionPolicy Bypass -File `"$SiteHubProject\tools\smoke-windows.ps1`" -PythonPath `"$venvPython`" -SkipDependencyInstall -SkipFrontendBuild"
 Write-Host '6. Register SiteHub startup only after data/UI/Profile acceptance:'
