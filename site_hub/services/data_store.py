@@ -5,11 +5,12 @@ import hashlib
 import json
 import re
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from site_hub.db import Database, SiteHubRepository
 from site_hub.notifications import NotificationOutboxStore
@@ -532,6 +533,111 @@ class DataLayerStore:
              now, now, owner_id),
         )
 
+    @staticmethod
+    def _backfill_enabled_browser_account_locked(
+        conn: sqlite3.Connection, account_id: str, now_utc: datetime,
+    ) -> bool:
+        """Attach a newly enabled default browser account to today's pending batch.
+
+        Account/capability/schedule activation and this insert share the caller's
+        ``BEGIN IMMEDIATE`` transaction.  The daily idempotency key remains the
+        final guard if batch creation or another PATCH races this operation.
+        """
+        eligible = conn.execute(
+            """SELECT c.id capability_id,c.site_id
+               FROM site_accounts a
+               JOIN capability_instances c
+                 ON c.account_id=a.id AND c.code='checkin'
+               JOIN schedules s ON s.capability_instance_id=c.id
+               WHERE a.id=? AND a.enabled=1 AND a.auth_state='ready'
+                 AND c.enabled=1 AND lower(coalesce(c.adapter,'')) NOT IN ('api','cookie')
+                 AND s.enabled=1 AND s.timezone='Asia/Shanghai'
+                 AND s.policy_type='daily_random_window'
+                 AND json_extract(s.policy_json,'$.mode') IS NULL
+               ORDER BY s.id LIMIT 1""",
+            (account_id,),
+        ).fetchone()
+        if eligible is None:
+            return False
+
+        timezone = ZoneInfo("Asia/Shanghai")
+        local = now_utc.astimezone(timezone).replace(second=0, microsecond=0)
+        date_key = local.date().isoformat()
+        idempotency_key = f"checkin:{account_id}:{date_key}"
+        if conn.execute(
+            "SELECT 1 FROM jobs WHERE idempotency_key=?", (idempotency_key,)
+        ).fetchone():
+            return False
+
+        batch = conn.execute(
+            """SELECT * FROM job_batches
+               WHERE business_date=? AND timezone='Asia/Shanghai'
+                 AND status='pending' AND schedule_id IS NULL
+                 AND trigger_reason IN ('normal','regenerated')
+               ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (date_key,),
+        ).fetchone()
+        if batch is None or batch["planned_at"] is None:
+            return False
+        try:
+            planned = datetime.fromisoformat(
+                str(batch["planned_at"]).replace("Z", "+00:00")
+            )
+        except ValueError:
+            return False
+        if planned.tzinfo is None:
+            planned = planned.replace(tzinfo=UTC)
+        effective = planned.astimezone(UTC)
+
+        # Match ScheduleCoordinator's one-shot misfire rule before exposing the
+        # new due job to the faster worker polling loop.
+        local_now_utc = local.astimezone(UTC)
+        if (
+            batch["trigger_reason"] == "normal"
+            and local_now_utc > effective + timedelta(minutes=5)
+        ):
+            latest = datetime.combine(local.date(), time(23, 0), timezone)
+            recovery = min(local + timedelta(hours=1), latest)
+            if recovery > local:
+                effective = recovery.astimezone(UTC)
+                effective_text = _iso(effective)
+                conn.execute(
+                    """UPDATE job_batches
+                       SET planned_at=?,trigger_reason='regenerated',updated_at=?
+                       WHERE id=? AND status='pending' AND trigger_reason='normal'""",
+                    (effective_text, _iso(now_utc), batch["id"]),
+                )
+                conn.execute(
+                    """UPDATE jobs SET planned_at=?,available_at=?,updated_at=?
+                       WHERE batch_id=? AND status='queued'""",
+                    (effective_text, effective_text, _iso(now_utc), batch["id"]),
+                )
+
+        effective_text = _iso(effective)
+        now_text = _iso(now_utc)
+        try:
+            conn.execute(
+                """INSERT INTO jobs(
+                       id,batch_id,kind,site_id,account_id,capability_instance_id,
+                       business_date,planned_at,available_at,priority,status,max_attempts,
+                       idempotency_key,payload_json,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(uuid4()), batch["id"], "checkin", eligible["site_id"],
+                    account_id, eligible["capability_id"], date_key,
+                    effective_text, effective_text, 50, "queued", 3,
+                    idempotency_key, _dumps({"batch_id": batch["id"]}),
+                    now_text, now_text,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            if not conn.execute(
+                "SELECT 1 FROM jobs WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone():
+                raise
+            return False
+        return True
+
     def _archive_site_sync(self, site_id: str) -> bool:
         now = _iso(datetime.now(UTC))
         with self.database.transaction(immediate=True) as conn:
@@ -752,7 +858,8 @@ class DataLayerStore:
                 and account["auth_state"] != "ready"
             ):
                 raise AccountNotReady("Verify the browser Profile before enabling this account")
-            now = _iso(datetime.now(UTC))
+            now_value = datetime.now(UTC)
+            now = _iso(now_value)
             account_fields: list[str] = []
             account_values: list[Any] = []
             if "name" in payload:
@@ -794,6 +901,10 @@ class DataLayerStore:
                         f"UPDATE schedules SET {','.join(schedule_fields)},updated_at=? WHERE id=?",
                         schedule_values,
                     )
+            if payload.get("enabled") is True and next_adapter not in {"api", "cookie"}:
+                self._backfill_enabled_browser_account_locked(
+                    conn, account_id, now_value,
+                )
             if "enabled" in payload and not bool(payload["enabled"]):
                 self._cancel_queued_checkins_locked(conn, now, account_id=account_id)
         return self._account_row(account_id)

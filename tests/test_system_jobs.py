@@ -12,10 +12,11 @@ from site_hub.jobs.dispatcher import JobDispatcher
 from site_hub.jobs.system_dispatcher import BookmarkStaging, SystemExecutionError, SystemJobDispatcher
 from site_hub.models import JobKind, JobStatus
 from site_hub.scrapers.models import ScrapedProduct
+from site_hub.services import data_store as data_store_module
 from site_hub.services.data_store import DataLayerStore
 from site_hub.services.events import EventBroker
 from site_hub.services.memory_store import MemoryStore
-from site_hub.services.ports import StaleJobWrite
+from site_hub.services.ports import AccountNotReady, StaleJobWrite
 
 
 class FakeSupervisor:
@@ -432,6 +433,212 @@ async def test_disabling_default_account_and_archiving_site_cancel_queued_checki
         assert override_job["result"] == {
             "reason_code": "disabled", "cancelled_before_start": True,
         }
+    finally:
+        await store.close()
+
+
+def _freeze_data_store_clock(monkeypatch, instant: datetime) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz is not None else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr(data_store_module, "datetime", FrozenDateTime)
+
+
+async def _ready_browser_account(store: DataLayerStore, site_id: UUID) -> dict:
+    account = await store.create_account(site_id, {
+        "name": "Browser", "adapter": "worker-adapter", "enabled": False,
+    })
+    verified = await store.set_account_profile_verification(
+        UUID(str(account["id"])), "ready", verified_at="2026-08-04T00:00:00Z",
+    )
+    assert verified and verified["auth_state"] == "ready"
+    return verified
+
+
+@pytest.mark.asyncio
+async def test_enabling_ready_browser_account_backfills_today_pending_batch_once(
+    tmp_path, monkeypatch,
+):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    try:
+        site = await store.create_site({
+            "name": "Check-in site", "url": "https://checkin.example", "status": "active",
+        })
+        site_id = UUID(str(site["id"]))
+        account = await _ready_browser_account(store, site_id)
+        planned = datetime(2026, 8, 4, 9, 47, 6, tzinfo=UTC)
+        batch = await store.create_batch(
+            {"date_key": "2026-08-04", "planned_at": planned}, [],
+        )
+        _freeze_data_store_clock(
+            monkeypatch, datetime(2026, 8, 4, 1, 0, tzinfo=UTC),
+        )
+
+        enabled = await store.update_account(UUID(str(account["id"])), {"enabled": True})
+        enabled_again = await store.update_account(
+            UUID(str(account["id"])), {"enabled": True},
+        )
+
+        assert enabled and enabled["enabled"] is True
+        assert enabled_again and enabled_again["enabled"] is True
+        with store.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE account_id=? AND kind='checkin'",
+                (str(account["id"]),),
+            ).fetchall()
+        assert len(rows) == 1
+        job = rows[0]
+        assert job["batch_id"] == str(batch["id"])
+        assert job["business_date"] == "2026-08-04"
+        assert job["planned_at"] == "2026-08-04T09:47:06.000Z"
+        assert job["available_at"] == job["planned_at"]
+        assert job["idempotency_key"] == f"checkin:{account['id']}:2026-08-04"
+        assert (job["priority"], job["status"], job["max_attempts"]) == (50, "queued", 3)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_backfilled_browser_account_applies_existing_misfire_recovery(
+    tmp_path, monkeypatch,
+):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    try:
+        site = await store.create_site({
+            "name": "Check-in site", "url": "https://checkin.example", "status": "active",
+        })
+        site_id = UUID(str(site["id"]))
+        existing = await store.create_account(site_id, {
+            "name": "API", "adapter": "api", "enabled": True,
+        })
+        browser = await _ready_browser_account(store, site_id)
+        batch = await store.create_batch(
+            {
+                "date_key": "2026-08-04",
+                "planned_at": datetime(2026, 8, 4, 2, 0, tzinfo=UTC),
+            },
+            [UUID(str(existing["id"]))],
+        )
+        _freeze_data_store_clock(
+            monkeypatch, datetime(2026, 8, 4, 4, 0, tzinfo=UTC),
+        )  # 12:00 Shanghai; recover once at 13:00.
+
+        await store.update_account(UUID(str(browser["id"])), {"enabled": True})
+
+        with store.database.connect() as conn:
+            stored_batch = conn.execute(
+                "SELECT * FROM job_batches WHERE id=?", (str(batch["id"]),),
+            ).fetchone()
+            jobs = conn.execute(
+                "SELECT * FROM jobs WHERE batch_id=? ORDER BY account_id", (str(batch["id"]),),
+            ).fetchall()
+        assert stored_batch["trigger_reason"] == "regenerated"
+        assert stored_batch["planned_at"] == "2026-08-04T05:00:00.000Z"
+        assert len(jobs) == 2
+        assert all(job["planned_at"] == stored_batch["planned_at"] for job in jobs)
+        assert all(job["available_at"] == stored_batch["planned_at"] for job in jobs)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_backfilled_browser_account_runs_immediately_after_recovery_cutoff(
+    tmp_path, monkeypatch,
+):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    try:
+        site = await store.create_site({
+            "name": "Check-in site", "url": "https://checkin.example", "status": "active",
+        })
+        account = await _ready_browser_account(store, UUID(str(site["id"])))
+        batch = await store.create_batch(
+            {
+                "date_key": "2026-08-04",
+                "planned_at": datetime(2026, 8, 4, 2, 0, tzinfo=UTC),
+            },
+            [],
+        )
+        _freeze_data_store_clock(
+            monkeypatch, datetime(2026, 8, 4, 15, 15, tzinfo=UTC),
+        )  # 23:15 Shanghai; the existing rule no longer defers.
+
+        await store.update_account(UUID(str(account["id"])), {"enabled": True})
+
+        with store.database.connect() as conn:
+            stored_batch = conn.execute(
+                "SELECT * FROM job_batches WHERE id=?", (str(batch["id"]),),
+            ).fetchone()
+            job = conn.execute(
+                "SELECT * FROM jobs WHERE account_id=? AND kind='checkin'",
+                (str(account["id"]),),
+            ).fetchone()
+        assert stored_batch["trigger_reason"] == "normal"
+        assert stored_batch["planned_at"] == "2026-08-04T02:00:00.000Z"
+        assert job["available_at"] == stored_batch["planned_at"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_backfill_skips_override_and_rejects_failed_browser_profile(
+    tmp_path, monkeypatch,
+):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    try:
+        site = await store.create_site({
+            "name": "Check-in site", "url": "https://checkin.example", "status": "active",
+        })
+        site_id = UUID(str(site["id"]))
+        override = await store.create_account(site_id, {
+            "name": "Override", "adapter": "worker-adapter", "enabled": False,
+            "schedule_override": {
+                "mode": "fixed_time", "time": "09:30", "timezone": "Asia/Shanghai",
+            },
+        })
+        await store.set_account_profile_verification(
+            UUID(str(override["id"])), "ready", verified_at="2026-08-04T00:00:00Z",
+        )
+        failed = await store.create_account(site_id, {
+            "name": "Failed", "adapter": "worker-adapter", "enabled": False,
+        })
+        await store.set_account_profile_verification(
+            UUID(str(failed["id"])), "error", error="verification failed",
+        )
+        await store.create_batch(
+            {
+                "date_key": "2026-08-04",
+                "planned_at": datetime(2026, 8, 4, 9, 47, 6, tzinfo=UTC),
+            },
+            [],
+        )
+        _freeze_data_store_clock(
+            monkeypatch, datetime(2026, 8, 4, 1, 0, tzinfo=UTC),
+        )
+
+        enabled_override = await store.update_account(
+            UUID(str(override["id"])), {"enabled": True},
+        )
+        with pytest.raises(AccountNotReady):
+            await store.update_account(UUID(str(failed["id"])), {"enabled": True})
+
+        assert enabled_override and enabled_override["enabled"] is True
+        with store.database.connect() as conn:
+            assert conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+            failed_state = conn.execute(
+                """SELECT a.enabled,c.enabled capability_enabled,s.enabled schedule_enabled
+                   FROM site_accounts a
+                   JOIN capability_instances c ON c.account_id=a.id AND c.code='checkin'
+                   JOIN schedules s ON s.capability_instance_id=c.id
+                   WHERE a.id=?""",
+                (str(failed["id"]),),
+            ).fetchone()
+        assert tuple(failed_state) == (0, 0, 0)
     finally:
         await store.close()
 
