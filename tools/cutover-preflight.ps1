@@ -330,9 +330,39 @@ foreach ($group in $processGroups) {
 
 if ($null -ne (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
     try {
-        $ownedProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+        $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        $processById = @{}
+        foreach ($process in $allProcesses) {
+            $processById[[int]$process.ProcessId] = $process
+        }
+
+        # An outer PowerShell/cmd wrapper may launch this script and therefore
+        # contain every project path in its own command line. Exclude only the
+        # contiguous shell ancestors that explicitly invoke this exact script;
+        # unrelated project processes remain blockers.
+        $preflightScriptPath = [System.IO.Path]::GetFullPath($MyInvocation.MyCommand.Path)
+        $preflightScriptPattern = '(?i)(?:^|[\s"''])' +
+            [regex]::Escape($preflightScriptPath) + '(?:[\s"'']|$)'
+        $preflightInvokerProcessIds = New-Object 'System.Collections.Generic.HashSet[int]'
+        [void]$preflightInvokerProcessIds.Add([int]$PID)
+        $cursorProcess = $processById[[int]$PID]
+        while ($null -ne $cursorProcess) {
+            $parentProcessId = [int]$cursorProcess.ParentProcessId
+            if (-not $processById.ContainsKey($parentProcessId)) { break }
+            $parentProcess = $processById[$parentProcessId]
+            $parentName = ([string]$parentProcess.Name).ToLowerInvariant()
+            $parentCommandLine = [string]$parentProcess.CommandLine
+            $isShellWrapper = $parentName -in @('powershell.exe', 'pwsh.exe', 'cmd.exe')
+            $invokesThisScript = $parentCommandLine -and
+                $parentCommandLine -match $preflightScriptPattern
+            if (-not ($isShellWrapper -and $invokesThisScript)) { break }
+            [void]$preflightInvokerProcessIds.Add($parentProcessId)
+            $cursorProcess = $parentProcess
+        }
+
+        $ownedProcesses = @($allProcesses | Where-Object {
             $commandLine = [string]$_.CommandLine
-            $_.ProcessId -ne $PID -and $commandLine -and (
+            -not $preflightInvokerProcessIds.Contains([int]$_.ProcessId) -and $commandLine -and (
                 $commandLine.IndexOf($VShopProject, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
                 $commandLine.IndexOf($AutoCheckinProject, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
                 $commandLine -match '(?i)(?:^|[\s"''])app\.py(?:[\s"'']|$)' -or
