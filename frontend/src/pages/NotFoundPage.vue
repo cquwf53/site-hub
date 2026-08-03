@@ -1,0 +1,2 @@
+<template><div class="not-found"><span>404</span><h1>页面不存在</h1><p>这个地址可能已变更，或内容已经删除。</p><RouterLink class="button" to="/overview">返回总览</RouterLink></div></template>
+<style scoped>.not-found { display: flex; min-height: 65vh; flex-direction: column; align-items: center; justify-content: center; text-align: center; }.not-found > span { color: var(--accent); font-size: 44px; font-weight: 700; }.not-found p { margin-bottom: 20px; }</style>

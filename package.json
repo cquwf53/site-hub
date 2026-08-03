@@ -1,0 +1,19 @@
+{
+  "name": "site-hub",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "worker-node"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace frontend",
+    "typecheck": "npm run typecheck --workspace frontend",
+    "test": "npm run test --workspaces --if-present",
+    "test:worker": "npm run test --workspace worker-node",
+    "test:frontend": "npm run test --workspace frontend"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  }
+}
