@@ -39,9 +39,26 @@ export interface Tag {
   sort_order?: number
 }
 
+export interface SiteType {
+  id: ID
+  name: string
+  slug: string
+  color?: string | null
+  icon?: string | null
+  sort_order: number
+  enabled: boolean
+  is_system: boolean
+  is_default: boolean
+  site_count: number
+  created_at?: string
+  updated_at?: string
+}
+
 export interface Site {
   id: ID
   folder_id: ID | null
+  site_type_id?: ID | null
+  site_type?: SiteType | null
   name: string
   url: string
   default_endpoint_id?: ID

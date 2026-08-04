@@ -4,25 +4,27 @@ import { useRouter } from 'vue-router'
 import DynamicSchemaForm from '@/components/DynamicSchemaForm.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
 import { api, apiErrorMessage } from '@/api/client'
-import type { AdapterManifest, Folder, Site, Tag } from '@/api/types'
+import type { AdapterManifest, Folder, Site, SiteType, Tag } from '@/api/types'
 import { useAppStore } from '@/stores/app'
+import { siteTypeIcon } from '@/utils/siteType'
 import { useSiteDetail } from './siteContext'
 
 interface ProductSettings { enabled: boolean; interval_override_minutes: number | null; effective_interval_minutes?: number; scraper_type?: string; config?: Record<string, unknown>; configured_secret_fields?: string[]; [key: string]: unknown }
 const { site, refresh } = useSiteDetail(); const app = useAppStore(); const router = useRouter()
-const folders = ref<Folder[]>([]); const tags = ref<Tag[]>([]); const manifests = ref<AdapterManifest[]>([]); const product = ref<ProductSettings>({ enabled: false, interval_override_minutes: null })
-const basic = ref({ name: '', url: '', folder_id: null as string | null, description: '', note: '', pinned: false, tag_ids: [] as string[] })
+const folders = ref<Folder[]>([]); const tags = ref<Tag[]>([]); const siteTypes = ref<SiteType[]>([]); const manifests = ref<AdapterManifest[]>([]); const product = ref<ProductSettings>({ enabled: false, interval_override_minutes: null })
+const basic = ref({ name: '', url: '', folder_id: null as string | null, site_type_id: null as string | null, description: '', note: '', pinned: false, tag_ids: [] as string[] })
 const adapter = ref({ id: '', config: {} as Record<string, unknown>, clear_secrets: [] as string[] }); const configuredAdapterSecrets = ref<string[]>([]); const saving = ref(''); const deleteOpen = ref(false)
 const productManifests = computed(() => manifests.value.filter((item) => item.capabilities.includes('product_monitor')))
 const manifest = computed(() => productManifests.value.find((item) => item.id === adapter.value.id))
+const availableSiteTypes = computed(() => siteTypes.value.filter((item) => item.enabled || item.id === basic.value.site_type_id))
 
 async function load() {
   if (!site.value) return
-  basic.value = { name: site.value.name, url: site.value.url, folder_id: site.value.folder_id, description: site.value.description || '', note: site.value.note || '', pinned: site.value.pinned, tag_ids: site.value.tags?.map((tag) => tag.id) || [] }
+  basic.value = { name: site.value.name, url: site.value.url, folder_id: site.value.folder_id, site_type_id: site.value.site_type_id || null, description: site.value.description || '', note: site.value.note || '', pinned: site.value.pinned, tag_ids: site.value.tags?.map((tag) => tag.id) || [] }
   adapter.value = { id: site.value.adapter || '', config: structuredClone(site.value.config || {}), clear_secrets: [] }
   configuredAdapterSecrets.value = site.value.configured_secret_fields || []
   try {
-    ;[folders.value, tags.value, manifests.value] = await Promise.all([api.get<Folder[]>('/folders'), api.get<Tag[]>('/tags'), api.get<AdapterManifest[]>('/adapters')])
+    ;[folders.value, tags.value, siteTypes.value, manifests.value] = await Promise.all([api.get<Folder[]>('/folders'), api.get<Tag[]>('/tags'), api.get<SiteType[]>('/site-types'), api.get<AdapterManifest[]>('/adapters')])
     product.value = await api.get<ProductSettings>(`/sites/${site.value.id}/product-settings`)
     adapter.value = {
       id: product.value.scraper_type === 'none' ? '' : product.value.scraper_type || adapter.value.id,
@@ -43,7 +45,8 @@ onMounted(load)
   <div class="settings-stack">
     <section class="card"><div class="card-header"><div><h2>基本信息</h2><p class="subtle-text">名称、网址与整理方式</p></div></div><form class="card-body form-grid" @submit.prevent="saveBasic">
       <div class="field"><label for="settings-name">名称</label><input id="settings-name" v-model.trim="basic.name" required /></div><div class="field"><label for="settings-url">网站地址</label><input id="settings-url" v-model.trim="basic.url" required type="url" /></div>
-      <div class="field"><label for="settings-folder">目录</label><select id="settings-folder" v-model="basic.folder_id"><option :value="null">未归档</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></div><div class="field"><label for="settings-tags">标签</label><select id="settings-tags" v-model="basic.tag_ids" multiple><option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.name }}</option></select></div>
+      <div class="field"><label for="settings-folder">目录</label><select id="settings-folder" v-model="basic.folder_id"><option :value="null">未归档</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></div><div class="field"><label for="settings-site-type">主类型</label><select id="settings-site-type" v-model="basic.site_type_id" required><option :value="null" disabled>请选择网站类型</option><option v-for="siteType in availableSiteTypes" :key="siteType.id" :value="siteType.id">{{ siteTypeIcon(siteType.icon) }} {{ siteType.name }}{{ siteType.enabled ? '' : '（已停用）' }}</option></select></div>
+      <div class="field span-2"><label for="settings-tags">标签</label><select id="settings-tags" v-model="basic.tag_ids" multiple><option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.name }}</option></select><p class="field-help">主类型用于统一分类，标签可跨类型补充多个维度。</p></div>
       <div class="field span-2"><label for="settings-description">简介</label><textarea id="settings-description" v-model="basic.description" /></div><div class="field span-2"><label for="settings-note">私人备注</label><textarea id="settings-note" v-model="basic.note" /></div>
       <div class="switch-row span-2"><div><div class="field-label">置顶网站</div><p class="field-help">在网站列表中优先显示。</p></div><button type="button" class="switch" :class="{ on: basic.pinned }" :aria-pressed="basic.pinned" @click="basic.pinned = !basic.pinned" /></div>
       <div class="form-actions span-2"><button class="button" :disabled="saving === 'basic'">{{ saving === 'basic' ? '保存中…' : '保存基本信息' }}</button></div>

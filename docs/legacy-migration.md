@@ -40,6 +40,10 @@ databases into a new Site Hub database. It never edits either source database.
 - Imported sites are placed under `导入数据/VShop/<legacy kind>` and
   `导入数据/AutoCheckin`; the VShop `kind` value is preserved verbatim as the
   final folder name.
+- Legacy site `kind` values are also mapped to deterministic controlled website
+  types. Known `shop`, `checkin`, `tool`, and `bookmark` values use the built-in
+  types; an unknown value receives a deterministic type UUID instead of being
+  discarded.
 - Each imported run/job stores its untouched legacy status alongside the mapped
   SiteHub status. No semantic meaning is inferred from legacy message text.
 

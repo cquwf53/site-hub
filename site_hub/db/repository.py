@@ -58,21 +58,142 @@ class SiteHubRepository:
                 "SELECT * FROM folders ORDER BY parent_id IS NOT NULL, parent_id, sort_order, name, id"
             )]
 
+    # -- Site types -----------------------------------------------------
+    @staticmethod
+    def _resolve_site_type_locked(
+        conn: sqlite3.Connection, *, site_type_id: str | None = None,
+        kind: str | None = None, require_enabled: bool = True,
+    ) -> sqlite3.Row:
+        normalized_kind = str(kind).strip().lower() if kind is not None else None
+        if site_type_id is not None:
+            row = conn.execute("SELECT * FROM site_types WHERE id=?", (site_type_id,)).fetchone()
+            if row is not None and normalized_kind is not None and row["slug"].lower() != normalized_kind:
+                raise ValueError("site_type_id and kind refer to different site types")
+        else:
+            row = conn.execute(
+                "SELECT * FROM site_types WHERE slug=? COLLATE NOCASE",
+                (normalized_kind or "other",),
+            ).fetchone()
+        if row is None:
+            raise ValueError("site type not found")
+        if require_enabled and not bool(row["enabled"]):
+            raise ValueError("site type is disabled")
+        return row
+
+    @staticmethod
+    def _site_type_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["enabled"] = bool(result["enabled"])
+        result["is_system"] = bool(result["is_system"])
+        result["is_default"] = bool(result["is_default"])
+        result["site_count"] = int(conn.execute(
+            "SELECT COUNT(*) FROM sites WHERE site_type_id=?", (row["id"],)
+        ).fetchone()[0])
+        return result
+
+    def list_site_types(self, *, enabled: bool | None = None) -> list[dict[str, Any]]:
+        where = " WHERE enabled=?" if enabled is not None else ""
+        params: tuple[Any, ...] = (int(enabled),) if enabled is not None else ()
+        with self.database.connect() as conn:
+            return [self._site_type_dict(conn, row) for row in conn.execute(
+                "SELECT * FROM site_types" + where +
+                " ORDER BY enabled DESC,sort_order,name COLLATE NOCASE,id",
+                params,
+            )]
+
+    def get_site_type(self, site_type_id: str) -> dict[str, Any] | None:
+        with self.database.connect() as conn:
+            row = conn.execute("SELECT * FROM site_types WHERE id=?", (site_type_id,)).fetchone()
+            return self._site_type_dict(conn, row) if row is not None else None
+
+    def create_site_type(
+        self, *, name: str, slug: str, color: str = "#64748b", icon: str = "globe",
+        sort_order: int = 0, enabled: bool = True, site_type_id: str | None = None,
+    ) -> dict[str, Any]:
+        identifier, now = site_type_id or new_uuid(), utc_now()
+        with self.database.transaction() as conn:
+            conn.execute(
+                """INSERT INTO site_types(
+                       id,name,slug,color,icon,sort_order,enabled,is_system,is_default,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,0,0,?,?)""",
+                (
+                    identifier, name.strip(), slug.strip().lower(), color.lower(), icon.strip(),
+                    sort_order, int(enabled), now, now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM site_types WHERE id=?", (identifier,)).fetchone()
+            return self._site_type_dict(conn, row)
+
+    def update_site_type(self, site_type_id: str, **changes: Any) -> dict[str, Any] | None:
+        allowed = {"name", "slug", "color", "icon", "sort_order", "enabled"}
+        unsupported = set(changes) - allowed
+        if unsupported:
+            raise ValueError(f"unsupported site type field: {sorted(unsupported)[0]}")
+        with self.database.transaction(immediate=True) as conn:
+            current = conn.execute("SELECT * FROM site_types WHERE id=?", (site_type_id,)).fetchone()
+            if current is None:
+                return None
+            if bool(current["is_system"]):
+                if "slug" in changes and str(changes["slug"]).strip().lower() != current["slug"]:
+                    raise ValueError("built-in site type slug cannot be changed")
+                if changes.get("enabled") is False:
+                    raise ValueError("built-in site type cannot be disabled")
+            normalized = dict(changes)
+            for key in ("name", "slug", "icon"):
+                if key in normalized:
+                    normalized[key] = str(normalized[key]).strip()
+            if "slug" in normalized:
+                normalized["slug"] = normalized["slug"].lower()
+            if "color" in normalized:
+                normalized["color"] = str(normalized["color"]).lower()
+            if "enabled" in normalized:
+                normalized["enabled"] = int(bool(normalized["enabled"]))
+            if normalized:
+                fields = [f"{key}=?" for key in normalized]
+                conn.execute(
+                    f"UPDATE site_types SET {','.join(fields)},updated_at=? WHERE id=?",
+                    [*normalized.values(), utc_now(), site_type_id],
+                )
+                if "slug" in normalized:
+                    conn.execute(
+                        "UPDATE sites SET kind=?,updated_at=? WHERE site_type_id=?",
+                        (normalized["slug"], utc_now(), site_type_id),
+                    )
+            row = conn.execute("SELECT * FROM site_types WHERE id=?", (site_type_id,)).fetchone()
+            return self._site_type_dict(conn, row)
+
+    def delete_site_type(self, site_type_id: str) -> bool:
+        with self.database.transaction(immediate=True) as conn:
+            row = conn.execute("SELECT * FROM site_types WHERE id=?", (site_type_id,)).fetchone()
+            if row is None:
+                return False
+            if bool(row["is_system"]):
+                raise ValueError("built-in site type cannot be deleted")
+            if conn.execute(
+                "SELECT 1 FROM sites WHERE site_type_id=? LIMIT 1", (site_type_id,)
+            ).fetchone():
+                raise ValueError("site type is still assigned to one or more sites")
+            return conn.execute("DELETE FROM site_types WHERE id=?", (site_type_id,)).rowcount == 1
+
     # -- Sites -----------------------------------------------------------
     def create_site(
         self, *, folder_id: str, name: str, origin: str, canonical_host: str,
-        kind: str = "other", status: str = "active", description: str = "",
+        kind: str | None = None, site_type_id: str | None = None,
+        status: str = "active", description: str = "",
         note: str = "", icon: str = "", pinned: bool = False,
         sort_order: int = 0, site_id: str | None = None,
     ) -> dict[str, Any]:
         identifier, now = site_id or new_uuid(), utc_now()
         with self.database.transaction() as conn:
+            site_type = self._resolve_site_type_locked(
+                conn, site_type_id=site_type_id, kind=kind,
+            )
             conn.execute(
                 """INSERT INTO sites(
-                    id,folder_id,name,origin,canonical_host,kind,status,description,note,
+                    id,folder_id,name,origin,canonical_host,kind,site_type_id,status,description,note,
                     icon,pinned,sort_order,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (identifier, folder_id, name.strip(), origin, canonical_host.lower(), kind,
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (identifier, folder_id, name.strip(), origin, canonical_host.lower(), site_type["slug"], site_type["id"],
                  status, description, note, icon, int(pinned), sort_order, now, now),
             )
             return dict(conn.execute("SELECT * FROM sites WHERE id=?", (identifier,)).fetchone())
@@ -105,24 +226,38 @@ class SiteHubRepository:
 
     def update_site(self, site_id: str, **changes: Any) -> dict[str, Any] | None:
         allowed = {
-            "folder_id", "name", "origin", "canonical_host", "kind", "status",
+            "folder_id", "name", "origin", "canonical_host", "kind", "site_type_id", "status",
             "description", "note", "icon", "favicon_path", "pinned", "sort_order",
             "visit_count", "last_visited_at",
         }
-        fields, values = [], []
-        for key, value in changes.items():
-            if key not in allowed:
-                raise ValueError(f"unsupported site field: {key}")
-            if key == "pinned":
-                value = int(bool(value))
-            fields.append(f"{key}=?")
-            values.append(value)
-        if not fields:
-            return self.get_site(site_id)
-        fields.extend(["row_version=row_version+1", "updated_at=?"])
-        values.extend([utc_now(), site_id])
+        unsupported = set(changes) - allowed
+        if unsupported:
+            raise ValueError(f"unsupported site field: {sorted(unsupported)[0]}")
         with self.database.transaction() as conn:
-            conn.execute(f"UPDATE sites SET {','.join(fields)} WHERE id=?", values)
+            current = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+            if current is None:
+                return None
+            if "site_type_id" in changes or "kind" in changes:
+                site_type = self._resolve_site_type_locked(
+                    conn,
+                    site_type_id=changes.get("site_type_id"),
+                    kind=changes.get("kind") if "kind" in changes else None,
+                    require_enabled=False,
+                )
+                if not bool(site_type["enabled"]) and site_type["id"] != current["site_type_id"]:
+                    raise ValueError("site type is disabled")
+                changes["site_type_id"] = site_type["id"]
+                changes["kind"] = site_type["slug"]
+            fields, values = [], []
+            for key, value in changes.items():
+                if key == "pinned":
+                    value = int(bool(value))
+                fields.append(f"{key}=?")
+                values.append(value)
+            if fields:
+                fields.extend(["row_version=row_version+1", "updated_at=?"])
+                values.extend([utc_now(), site_id])
+                conn.execute(f"UPDATE sites SET {','.join(fields)} WHERE id=?", values)
             return _row(conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone())
 
     def delete_site(self, site_id: str) -> bool:

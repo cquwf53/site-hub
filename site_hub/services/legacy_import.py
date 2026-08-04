@@ -24,6 +24,7 @@ from typing import Any, Iterable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 from site_hub.db import Database, utc_now
+from site_hub.db.connection import stable_uuid
 from site_hub.services.secrets import SecretService, split_sensitive_url
 
 
@@ -645,13 +646,46 @@ class LegacyImporter:
         )
         origin, host = _origin_and_host(sensitive.url_base)
         now = utc_now()
+        normalized_kind = str(kind or "other").strip().lower() or "other"
+        site_type = target.execute(
+            "SELECT id,slug FROM site_types WHERE slug=? COLLATE NOCASE",
+            (normalized_kind,),
+        ).fetchone()
+        if site_type is None:
+            # Preserve unexpected legacy classifications as controlled types.
+            # The deterministic ID keeps rehearsal and final imports identical.
+            try:
+                target.execute(
+                    """INSERT INTO site_types(
+                           id,name,slug,color,icon,sort_order,enabled,is_system,is_default,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,800,1,0,0,?,?)""",
+                    (
+                        stable_uuid(f"site-type:{normalized_kind}"),
+                        str(kind).strip()[:100], normalized_kind[:64], "#64748b", "globe", now, now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # A legacy label can collide with another type name even when
+                # its slug differs. Keep the import usable without inventing a
+                # nondeterministic mapping.
+                pass
+            site_type = target.execute(
+                "SELECT id,slug FROM site_types WHERE slug=? COLLATE NOCASE",
+                (normalized_kind[:64],),
+            ).fetchone()
+        if site_type is None:
+            site_type = target.execute(
+                "SELECT id,slug FROM site_types WHERE is_default=1",
+            ).fetchone()
+        if site_type is None:
+            raise RuntimeError("default site type is missing")
         target.execute(
             """INSERT INTO sites(
-                id,folder_id,name,origin,canonical_host,kind,status,description,note,icon,
+                id,folder_id,name,origin,canonical_host,kind,site_type_id,status,description,note,icon,
                 favicon_path,pinned,sort_order,visit_count,last_visited_at,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (site_id, folder_id, str(_get(row, "name", f"Imported {legacy_id}")),
-             origin, host, kind or "other", status, str(_get(row, "description", "")),
+             origin, host, site_type["slug"], site_type["id"], status, str(_get(row, "description", "")),
              str(_get(row, "note", "")), str(_get(row, "icon", "")),
              _get(row, "favicon_path"), int(bool(_get(row, "pinned", 0))),
              int(_get(row, "sort_order", 0)), int(_get(row, "visit_count", 0)),

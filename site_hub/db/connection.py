@@ -6,6 +6,16 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+from uuid import UUID, uuid5
+
+
+SITEHUB_STABLE_NAMESPACE = UUID("f44bdd1d-0e2d-4f33-91e8-63aee61f45d4")
+
+
+def stable_uuid(value: object) -> str:
+    """Return a deterministic UUID used by schema/data migrations."""
+
+    return str(uuid5(SITEHUB_STABLE_NAMESPACE, str(value)))
 
 
 class Database:
@@ -40,6 +50,7 @@ class Database:
         else:
             conn = sqlite3.connect(self.path, timeout=self.timeout, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        conn.create_function("sitehub_uuid", 1, stable_uuid, deterministic=True)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(f"PRAGMA busy_timeout = {int(self.timeout * 1000)}")
         if not self.readonly:

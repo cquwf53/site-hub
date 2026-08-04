@@ -37,6 +37,7 @@ const router = createRouter({
         { path: '', redirect: { name: 'settings-general' } },
         { path: 'general', name: 'settings-general', component: () => import('@/pages/settings/GeneralSettingsPage.vue'), meta: { title: '通用设置' } },
         { path: 'schedules', name: 'settings-schedules', component: () => import('@/pages/settings/SchedulesSettingsPage.vue'), meta: { title: '调度管理' } },
+        { path: 'site-types', name: 'settings-site-types', component: () => import('@/pages/settings/SiteTypesSettingsPage.vue'), meta: { title: '网站类型' } },
         { path: 'tags', name: 'settings-tags', component: () => import('@/pages/settings/TagsSettingsPage.vue'), meta: { title: '标签设置' } },
         { path: 'notifications', name: 'settings-notifications', component: () => import('@/pages/settings/NotificationsSettingsPage.vue'), meta: { title: '通知设置' } },
         { path: 'adapters', name: 'settings-adapters', component: () => import('@/pages/settings/AdaptersSettingsPage.vue'), meta: { title: '适配器' } },

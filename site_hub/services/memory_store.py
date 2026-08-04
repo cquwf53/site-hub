@@ -6,8 +6,9 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+from site_hub.db.connection import stable_uuid
 from site_hub.scrapers.network import sanitize_log_value
-from site_hub.services.ports import AccountNotReady
+from site_hub.services.ports import AccountNotReady, SiteTypeConflict
 
 
 def _now() -> datetime:
@@ -68,6 +69,21 @@ class MemoryStore:
             }
         }
         self.sites: dict[UUID, dict[str, Any]] = {}
+        self.site_types: dict[UUID, dict[str, Any]] = {}
+        for name, slug, color, icon, sort_order, is_default in (
+            ("其他", "other", "#64748b", "globe", 900, True),
+            ("商城", "shop", "#4f46e5", "shopping-bag", 10, False),
+            ("签到", "checkin", "#059669", "calendar-check", 20, False),
+            ("工具", "tool", "#d97706", "wrench", 30, False),
+            ("书签", "bookmark", "#0284c7", "bookmark", 40, False),
+        ):
+            identifier = UUID(stable_uuid(f"site-type:{slug}"))
+            self.site_types[identifier] = {
+                "id": identifier, "name": name, "slug": slug, "color": color,
+                "icon": icon, "sort_order": sort_order, "enabled": True,
+                "is_system": True, "is_default": is_default,
+                "created_at": now, "updated_at": now,
+            }
         self.accounts: dict[UUID, dict[str, Any]] = {}
         self.product_settings: dict[UUID, dict[str, Any]] = {}
         self.product_schedules: dict[UUID, dict[str, Any]] = {}
@@ -89,38 +105,196 @@ class MemoryStore:
     async def close(self) -> None: pass
     async def ping(self) -> bool: return True
 
-    async def list_sites(self, *, page: int, page_size: int, q: str | None = None, folder_id=None, tag_id=None):
+    def _resolve_site_type(self, *, site_type_id=None, kind=None, require_enabled=True):
+        normalized_kind = str(kind).strip().lower() if kind is not None else None
+        row = None
+        if site_type_id is not None:
+            row = self.site_types.get(UUID(str(site_type_id)))
+            if row is not None and normalized_kind is not None and row["slug"] != normalized_kind:
+                raise SiteTypeConflict(
+                    "site_type_id and kind refer to different site types",
+                    code="SITE_TYPE_MISMATCH",
+                )
+        else:
+            wanted = normalized_kind or "other"
+            row = next((item for item in self.site_types.values() if item["slug"] == wanted), None)
+        if row is None:
+            raise SiteTypeConflict("Site type not found", code="SITE_TYPE_NOT_FOUND")
+        if require_enabled and not row["enabled"]:
+            raise SiteTypeConflict("Site type is disabled", code="SITE_TYPE_DISABLED")
+        return row
+
+    def _public_site_type(self, row):
+        result = deepcopy(row)
+        result["site_count"] = sum(
+            1 for site in self.sites.values()
+            if UUID(str(site.get("site_type_id"))) == UUID(str(row["id"]))
+        )
+        return result
+
+    def _public_site(self, row):
+        result = deepcopy(row)
+        type_row = self.site_types.get(UUID(str(result["site_type_id"])))
+        result["site_type"] = self._public_site_type(type_row) if type_row else None
+        return result
+
+    async def list_site_types(self, *, enabled=None):
+        rows = list(self.site_types.values())
+        if enabled is not None:
+            rows = [row for row in rows if row["enabled"] is bool(enabled)]
+        rows.sort(key=lambda row: (
+            not row["enabled"], row["sort_order"], row["name"].casefold(), str(row["id"]),
+        ))
+        return [self._public_site_type(row) for row in rows]
+
+    async def get_site_type(self, site_type_id):
+        row = self.site_types.get(UUID(str(site_type_id)))
+        return self._public_site_type(row) if row else None
+
+    async def create_site_type(self, payload):
+        name = str(payload["name"]).strip()
+        slug = str(payload["slug"]).strip().lower()
+        if any(row["name"].casefold() == name.casefold() or row["slug"] == slug
+               for row in self.site_types.values()):
+            raise SiteTypeConflict("A site type with this name or slug already exists")
+        identifier = uuid4(); now = _now().isoformat()
+        row = {
+            "id": identifier, "name": name, "slug": slug,
+            "color": str(payload.get("color", "#64748b")).lower(),
+            "icon": str(payload.get("icon", "globe")).strip(),
+            "sort_order": int(payload.get("sort_order", 0)),
+            "enabled": bool(payload.get("enabled", True)),
+            "is_system": False, "is_default": False,
+            "created_at": now, "updated_at": now,
+        }
+        self.site_types[identifier] = row
+        return self._public_site_type(row)
+
+    async def update_site_type(self, site_type_id, payload):
+        identifier = UUID(str(site_type_id)); row = self.site_types.get(identifier)
+        if row is None:
+            return None
+        values = dict(payload)
+        if row["is_system"]:
+            if "slug" in values and str(values["slug"]).strip().lower() != row["slug"]:
+                raise SiteTypeConflict(
+                    "Built-in site type slugs cannot be changed", code="SITE_TYPE_PROTECTED",
+                )
+            if values.get("enabled") is False:
+                raise SiteTypeConflict(
+                    "Built-in site types cannot be disabled", code="SITE_TYPE_PROTECTED",
+                )
+        next_name = str(values.get("name", row["name"])).strip()
+        next_slug = str(values.get("slug", row["slug"])).strip().lower()
+        if any(
+            other_id != identifier and (
+                other["name"].casefold() == next_name.casefold() or other["slug"] == next_slug
+            ) for other_id, other in self.site_types.items()
+        ):
+            raise SiteTypeConflict("A site type with this name or slug already exists")
+        old_slug = row["slug"]
+        for key in ("name", "slug", "color", "icon", "sort_order", "enabled"):
+            if key in values:
+                row[key] = values[key]
+        row["name"] = str(row["name"]).strip()
+        row["slug"] = str(row["slug"]).strip().lower()
+        row["color"] = str(row["color"]).lower()
+        row["icon"] = str(row["icon"]).strip()
+        row["sort_order"] = int(row["sort_order"])
+        row["enabled"] = bool(row["enabled"])
+        row["updated_at"] = _now().isoformat()
+        if row["slug"] != old_slug:
+            for site in self.sites.values():
+                if UUID(str(site["site_type_id"])) == identifier:
+                    site["kind"] = row["slug"]
+                    site["updated_at"] = _now().isoformat()
+        return self._public_site_type(row)
+
+    async def delete_site_type(self, site_type_id):
+        identifier = UUID(str(site_type_id)); row = self.site_types.get(identifier)
+        if row is None:
+            return False
+        if row["is_system"]:
+            raise SiteTypeConflict(
+                "Built-in site types cannot be deleted", code="SITE_TYPE_PROTECTED",
+            )
+        if any(UUID(str(site["site_type_id"])) == identifier for site in self.sites.values()):
+            raise SiteTypeConflict(
+                "Move the assigned sites before deleting this type", code="SITE_TYPE_IN_USE",
+            )
+        del self.site_types[identifier]
+        return True
+
+    async def bulk_set_site_type(self, site_ids, site_type_id):
+        type_row = self._resolve_site_type(site_type_id=site_type_id)
+        identifiers = list(dict.fromkeys(UUID(str(item)) for item in site_ids))
+        if any(item not in self.sites or self.sites[item].get("status") == "archived"
+               for item in identifiers):
+            raise SiteTypeConflict("One or more sites were not found", code="SITE_NOT_FOUND")
+        now = _now().isoformat()
+        for identifier in identifiers:
+            self.sites[identifier].update(
+                site_type_id=type_row["id"], kind=type_row["slug"], updated_at=now,
+            )
+        return {
+            "updated": len(identifiers), "site_type_id": type_row["id"],
+            "site_ids": identifiers,
+        }
+
+    async def list_sites(self, *, page: int, page_size: int, q: str | None = None, folder_id=None, tag_id=None, site_type_id=None):
         rows = [row for row in self.sites.values() if row.get("status") != "archived"]
         if q:
             needle = q.casefold()
             rows = [r for r in rows if needle in r["name"].casefold() or needle in r["url"].casefold()]
         if folder_id is not None: rows = [r for r in rows if str(r.get("folder_id")) == str(folder_id)]
         if tag_id is not None: rows = [r for r in rows if any(str(tag.get("id")) == str(tag_id) for tag in r.get("tags", []))]
+        if site_type_id is not None: rows = [r for r in rows if str(r.get("site_type_id")) == str(site_type_id)]
         rows.sort(key=lambda r: r["id"])
         start = (page - 1) * page_size
-        return deepcopy(rows[start:start + page_size]), len(rows)
+        return [self._public_site(row) for row in rows[start:start + page_size]], len(rows)
 
     async def get_site(self, site_id):
         row=self.sites.get(UUID(str(site_id)))
-        return deepcopy(row) if row and row.get("status")!="archived" else None
+        return self._public_site(row) if row and row.get("status")!="archived" else None
 
     async def create_site(self, payload):
         async with self._lock:
             site_id = uuid4()
+            site_type = self._resolve_site_type(
+                site_type_id=payload.get("site_type_id"), kind=payload.get("kind"),
+            )
             row = {"id": site_id, "favicon_path": None, "tags": [], "checkin_account_count": 0,
                    "product_count": 0, "adapter": None, "config": {}, "configured": False,
                    "configured_secret_fields": [], "created_at": _now().isoformat(),
-                   "updated_at": None, **payload}
+                   "updated_at": None, **payload,
+                   "site_type_id": site_type["id"], "kind": site_type["slug"]}
             row.pop("tag_ids", None)
             self.sites[site_id] = row
             if "product_monitor" in set(payload.get("capabilities") or []):
                 self._ensure_product_schedule(site_id)
-            return deepcopy(row)
+            return self._public_site(row)
 
     async def update_site(self, site_id, payload):
         site_id = UUID(str(site_id))
         if site_id not in self.sites: return None
         payload = dict(payload); payload.pop("tag_ids", None)
+        if "site_type_id" in payload or "kind" in payload:
+            if "site_type_id" in payload and payload["site_type_id"] is None:
+                raise SiteTypeConflict("A site must have a primary type", code="SITE_TYPE_REQUIRED")
+            if "kind" in payload and not str(payload["kind"] or "").strip():
+                raise SiteTypeConflict("A site must have a primary type", code="SITE_TYPE_REQUIRED")
+            site_type = self._resolve_site_type(
+                site_type_id=payload.get("site_type_id") if "site_type_id" in payload else None,
+                kind=payload.get("kind") if "kind" in payload else None,
+                require_enabled=False,
+            )
+            if (
+                not site_type["enabled"]
+                and UUID(str(site_type["id"])) != UUID(str(self.sites[site_id]["site_type_id"]))
+            ):
+                raise SiteTypeConflict("Site type is disabled", code="SITE_TYPE_DISABLED")
+            payload["site_type_id"] = site_type["id"]
+            payload["kind"] = site_type["slug"]
         clear_secrets = set(payload.pop("clear_secrets", []) or [])
         if "config" in payload:
             clean, new_secrets = _public_config(payload["config"] or {})
@@ -133,7 +307,7 @@ class MemoryStore:
             payload["configured_secret_fields"] = sorted(remaining)
             payload["configured"] = bool(self.sites[site_id].get("config") or remaining)
         self.sites[site_id].update(payload); self.sites[site_id]["updated_at"] = _now().isoformat()
-        return deepcopy(self.sites[site_id])
+        return self._public_site(self.sites[site_id])
 
     async def delete_site(self, site_id):
         site_id = UUID(str(site_id))

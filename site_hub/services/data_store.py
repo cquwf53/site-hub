@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from site_hub.db import Database, SiteHubRepository
 from site_hub.notifications import NotificationOutboxStore
 from site_hub.scrapers.network import sanitize_log_value
-from site_hub.services.ports import AccountNotReady, StaleJobWrite
+from site_hub.services.ports import AccountNotReady, SiteTypeConflict, StaleJobWrite
 
 
 T = TypeVar("T")
@@ -164,9 +164,182 @@ class DataLayerStore:
             if key not in existing:
                 self.repository.set_setting(key, value)
 
+    # -- Controlled site types --------------------------------------
+    @staticmethod
+    def _resolve_site_type_locked(
+        conn: sqlite3.Connection, *, site_type_id: str | None = None,
+        kind: str | None = None, require_enabled: bool = True,
+    ) -> sqlite3.Row:
+        normalized_kind = str(kind).strip().lower() if kind is not None else None
+        if site_type_id is not None:
+            row = conn.execute("SELECT * FROM site_types WHERE id=?", (site_type_id,)).fetchone()
+            if row is not None and normalized_kind is not None and row["slug"].lower() != normalized_kind:
+                raise SiteTypeConflict(
+                    "site_type_id and kind refer to different site types",
+                    code="SITE_TYPE_MISMATCH",
+                )
+        else:
+            row = conn.execute(
+                "SELECT * FROM site_types WHERE slug=? COLLATE NOCASE",
+                (normalized_kind or "other",),
+            ).fetchone()
+        if row is None:
+            raise SiteTypeConflict("Site type not found", code="SITE_TYPE_NOT_FOUND")
+        if require_enabled and not bool(row["enabled"]):
+            raise SiteTypeConflict("Site type is disabled", code="SITE_TYPE_DISABLED")
+        return row
+
+    @staticmethod
+    def _normalize_site_type(
+        conn: sqlite3.Connection, row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        result = dict(row)
+        result["enabled"] = bool(result["enabled"])
+        result["is_system"] = bool(result["is_system"])
+        result["is_default"] = bool(result["is_default"])
+        result["site_count"] = int(conn.execute(
+            "SELECT COUNT(*) FROM sites WHERE site_type_id=?", (row["id"],)
+        ).fetchone()[0])
+        return result
+
+    async def list_site_types(self, *, enabled: bool | None = None) -> list[dict[str, Any]]:
+        return await self._call(self.repository.list_site_types, enabled=enabled)
+
+    async def get_site_type(self, site_type_id: UUID) -> dict[str, Any] | None:
+        return await self._call(self.repository.get_site_type, _uuid(site_type_id))
+
+    async def create_site_type(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await self._call(
+                self.repository.create_site_type,
+                name=payload["name"], slug=payload["slug"],
+                color=payload.get("color", "#64748b"), icon=payload.get("icon", "globe"),
+                sort_order=int(payload.get("sort_order", 0)),
+                enabled=bool(payload.get("enabled", True)),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise SiteTypeConflict(
+                "A site type with this name or slug already exists",
+            ) from exc
+
+    async def update_site_type(
+        self, site_type_id: UUID, payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            return await self._call(
+                self._update_site_type_sync, _uuid(site_type_id), payload,
+            )
+        except sqlite3.IntegrityError as exc:
+            raise SiteTypeConflict(
+                "A site type with this name or slug already exists",
+            ) from exc
+
+    def _update_site_type_sync(
+        self, site_type_id: str, payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        allowed = {"name", "slug", "color", "icon", "sort_order", "enabled"}
+        unsupported = set(payload) - allowed
+        if unsupported:
+            raise ValueError(f"unsupported site type field: {sorted(unsupported)[0]}")
+        now = _iso(datetime.now(UTC))
+        with self.database.transaction(immediate=True) as conn:
+            current = conn.execute("SELECT * FROM site_types WHERE id=?", (site_type_id,)).fetchone()
+            if current is None:
+                return None
+            values = dict(payload)
+            if bool(current["is_system"]):
+                if "slug" in values and str(values["slug"]).strip().lower() != current["slug"]:
+                    raise SiteTypeConflict(
+                        "Built-in site type slugs cannot be changed",
+                        code="SITE_TYPE_PROTECTED",
+                    )
+                if values.get("enabled") is False:
+                    raise SiteTypeConflict(
+                        "Built-in site types cannot be disabled",
+                        code="SITE_TYPE_PROTECTED",
+                    )
+            for key in ("name", "slug", "icon"):
+                if key in values:
+                    values[key] = str(values[key]).strip()
+            if "slug" in values:
+                values["slug"] = str(values["slug"]).lower()
+            if "color" in values:
+                values["color"] = str(values["color"]).lower()
+            if "enabled" in values:
+                values["enabled"] = int(bool(values["enabled"]))
+            if values:
+                conn.execute(
+                    f"UPDATE site_types SET {','.join(key + '=?' for key in values)},updated_at=? WHERE id=?",
+                    [*values.values(), now, site_type_id],
+                )
+                if "slug" in values:
+                    conn.execute(
+                        "UPDATE sites SET kind=?,row_version=row_version+1,updated_at=? WHERE site_type_id=?",
+                        (values["slug"], now, site_type_id),
+                    )
+            row = conn.execute("SELECT * FROM site_types WHERE id=?", (site_type_id,)).fetchone()
+            return self._normalize_site_type(conn, row)
+
+    async def delete_site_type(self, site_type_id: UUID) -> bool:
+        return await self._call(self._delete_site_type_sync, _uuid(site_type_id))
+
+    def _delete_site_type_sync(self, site_type_id: str) -> bool:
+        with self.database.transaction(immediate=True) as conn:
+            row = conn.execute("SELECT * FROM site_types WHERE id=?", (site_type_id,)).fetchone()
+            if row is None:
+                return False
+            if bool(row["is_system"]):
+                raise SiteTypeConflict(
+                    "Built-in site types cannot be deleted", code="SITE_TYPE_PROTECTED",
+                )
+            if conn.execute(
+                "SELECT 1 FROM sites WHERE site_type_id=? LIMIT 1", (site_type_id,)
+            ).fetchone():
+                raise SiteTypeConflict(
+                    "Move the assigned sites before deleting this type",
+                    code="SITE_TYPE_IN_USE",
+                )
+            return conn.execute("DELETE FROM site_types WHERE id=?", (site_type_id,)).rowcount == 1
+
+    async def bulk_set_site_type(
+        self, site_ids: list[UUID], site_type_id: UUID,
+    ) -> dict[str, Any]:
+        normalized_ids = list(dict.fromkeys(_uuid(item) for item in site_ids))
+        return await self._call(
+            self._bulk_set_site_type_sync, normalized_ids, _uuid(site_type_id),
+        )
+
+    def _bulk_set_site_type_sync(
+        self, site_ids: list[str], site_type_id: str,
+    ) -> dict[str, Any]:
+        now = _iso(datetime.now(UTC))
+        with self.database.transaction(immediate=True) as conn:
+            site_type = self._resolve_site_type_locked(conn, site_type_id=site_type_id)
+            placeholders = ",".join("?" for _ in site_ids)
+            existing = {
+                str(row["id"]) for row in conn.execute(
+                    f"SELECT id FROM sites WHERE status!='archived' AND id IN ({placeholders})",
+                    site_ids,
+                )
+            }
+            missing = [site_id for site_id in site_ids if site_id not in existing]
+            if missing:
+                raise SiteTypeConflict(
+                    "One or more sites were not found", code="SITE_NOT_FOUND",
+                )
+            conn.execute(
+                f"""UPDATE sites SET site_type_id=?,kind=?,row_version=row_version+1,updated_at=?
+                    WHERE id IN ({placeholders})""",
+                [site_type["id"], site_type["slug"], now, *site_ids],
+            )
+        return {
+            "updated": len(site_ids), "site_type_id": site_type_id, "site_ids": site_ids,
+        }
+
     # -- Sites -------------------------------------------------------
     async def list_sites(self, *, page: int, page_size: int, q: str | None = None,
-                         folder_id: str | None = None, tag_id: UUID | None = None):
+                         folder_id: str | None = None, tag_id: UUID | None = None,
+                         site_type_id: UUID | None = None):
         rows = await self._call(self._site_rows)
         if q:
             needle = q.casefold()
@@ -176,6 +349,8 @@ class DataLayerStore:
             rows = [row for row in rows if str(row.get("folder_id")) == str(expected)]
         if tag_id is not None:
             rows = [row for row in rows if any(str(tag.get("id")) == str(tag_id) for tag in row.get("tags", []))]
+        if site_type_id is not None:
+            rows = [row for row in rows if str(row.get("site_type_id")) == str(site_type_id)]
         total = len(rows)
         start = (page - 1) * page_size
         return rows[start:start + page_size], total
@@ -280,6 +455,10 @@ class DataLayerStore:
                WHERE st.site_id=? ORDER BY t.sort_order,t.id""",
             (row["id"],),
         )]
+        type_row = conn.execute(
+            "SELECT * FROM site_types WHERE id=?", (row["site_type_id"],)
+        ).fetchone()
+        site_type = self._normalize_site_type(conn, type_row) if type_row is not None else None
         endpoint = conn.execute(
             """SELECT url_base,url_suffix_secret_id,query_keys_json
                FROM site_endpoints WHERE site_id=?
@@ -298,7 +477,8 @@ class DataLayerStore:
         return {
             "id": row["id"], "folder_id": row.get("folder_id"), "name": row["name"],
             "url": public_url, "origin": public_url,
-            "kind": row["kind"], "capabilities": capabilities or ["bookmark"],
+            "kind": row["kind"], "site_type_id": row.get("site_type_id"),
+            "site_type": site_type, "capabilities": capabilities or ["bookmark"],
             "description": row["description"], "note": row["note"], "icon": row["icon"],
             "status": row["status"], "pinned": bool(row["pinned"]),
             "favicon_path": row.get("favicon_path"), "tags": tags,
@@ -323,15 +503,20 @@ class DataLayerStore:
         requested.add("bookmark")
         tag_ids = list(dict.fromkeys(str(tag) for tag in payload.get("tag_ids") or []))
         with self.database.transaction(immediate=True) as conn:
+            site_type = self._resolve_site_type_locked(
+                conn,
+                site_type_id=str(payload["site_type_id"]) if payload.get("site_type_id") else None,
+                kind=str(payload["kind"]) if payload.get("kind") is not None else None,
+            )
             conn.execute(
                 """INSERT INTO sites(
-                       id,folder_id,name,origin,canonical_host,kind,status,description,note,
+                       id,folder_id,name,origin,canonical_host,kind,site_type_id,status,description,note,
                        icon,pinned,sort_order,created_at,updated_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     site_id, str(payload.get("folder_id") or self.ROOT_FOLDER_ID),
                     str(payload["name"]).strip(), origin, (parts.hostname or "").lower(),
-                    payload.get("kind", "other"), payload.get("status", "active"),
+                    site_type["slug"], site_type["id"], payload.get("status", "active"),
                     payload.get("description", ""), payload.get("note", ""),
                     payload.get("icon", ""), int(bool(payload.get("pinned", False))),
                     int(payload.get("sort_order", 0)), now, now,
@@ -380,7 +565,7 @@ class DataLayerStore:
         config = values.pop("config", None)
         clear_secrets = set(values.pop("clear_secrets", []) or [])
         allowed = {
-            "folder_id", "name", "origin", "canonical_host", "kind", "status",
+            "folder_id", "name", "origin", "canonical_host", "kind", "site_type_id", "status",
             "description", "note", "icon", "favicon_path", "pinned", "sort_order",
             "visit_count", "last_visited_at",
         }
@@ -402,8 +587,36 @@ class DataLayerStore:
         obsolete_secret_ids: set[str] = set()
         now = _iso(datetime.now(UTC))
         with self.database.transaction(immediate=True) as conn:
-            if not conn.execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone():
+            current_site = conn.execute(
+                "SELECT site_type_id FROM sites WHERE id=?", (site_id,)
+            ).fetchone()
+            if not current_site:
                 return None
+
+            if "site_type_id" in values or "kind" in values:
+                if "site_type_id" in values and values["site_type_id"] is None:
+                    raise SiteTypeConflict(
+                        "A site must have a primary type", code="SITE_TYPE_REQUIRED",
+                    )
+                if "kind" in values and not str(values["kind"] or "").strip():
+                    raise SiteTypeConflict(
+                        "A site must have a primary type", code="SITE_TYPE_REQUIRED",
+                    )
+                site_type = self._resolve_site_type_locked(
+                    conn,
+                    site_type_id=(
+                        str(values["site_type_id"]) if "site_type_id" in values else None
+                    ),
+                    kind=str(values["kind"]) if "kind" in values else None,
+                    require_enabled=False,
+                )
+                if (
+                    not bool(site_type["enabled"])
+                    and str(site_type["id"]) != str(current_site["site_type_id"])
+                ):
+                    raise SiteTypeConflict("Site type is disabled", code="SITE_TYPE_DISABLED")
+                values["site_type_id"] = site_type["id"]
+                values["kind"] = site_type["slug"]
 
             if url is not None:
                 endpoint = conn.execute(
