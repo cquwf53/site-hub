@@ -12,6 +12,7 @@ from site_hub.jobs.dispatcher import JobDispatcher
 from site_hub.jobs.system_dispatcher import BookmarkStaging, SystemExecutionError, SystemJobDispatcher
 from site_hub.models import JobKind, JobStatus
 from site_hub.scrapers.models import ScrapedProduct
+from site_hub.scheduling.coordinator import ScheduleCoordinator
 from site_hub.services import data_store as data_store_module
 from site_hub.services.data_store import DataLayerStore
 from site_hub.services.events import EventBroker
@@ -496,6 +497,142 @@ async def _ready_browser_account(store: DataLayerStore, site_id: UUID) -> dict:
     )
     assert verified and verified["auth_state"] == "ready"
     return verified
+
+
+@pytest.mark.asyncio
+async def test_checkin_batch_tracks_running_completion_and_rejects_late_regeneration(
+    tmp_path, monkeypatch,
+):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    try:
+        site = await store.create_site({
+            "name": "Batch site", "url": "https://batch.example", "status": "active",
+        })
+        site_id = UUID(str(site["id"]))
+        accounts = [
+            await store.create_account(site_id, {
+                "name": name, "adapter": "api", "enabled": True,
+            })
+            for name in ("First", "Second")
+        ]
+        planned = datetime.now(UTC) - timedelta(seconds=1)
+        date_key = planned.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        batch = await store.create_batch(
+            {"date_key": date_key, "planned_at": planned},
+            [UUID(str(account["id"])) for account in accounts],
+        )
+        jobs = JobService(store, EventBroker())
+
+        first = await jobs.lease(JobKind.CHECKIN, "batch-worker")
+        assert first is not None
+        running_batch = await store.get_batch(UUID(str(batch["id"])))
+        assert running_batch and running_batch["status"] == "running"
+        assert running_batch["started_at"] is not None
+        assert running_batch["completed_at"] is None
+
+        await jobs.mark_running(UUID(str(first["id"])), str(first["lease_token"]))
+        await jobs.complete(
+            UUID(str(first["id"])), str(first["lease_token"]),
+            status=JobStatus.SUCCEEDED, result={"reason_code": "success"},
+        )
+        middle = await store.get_batch(UUID(str(batch["id"])))
+        assert middle and middle["status"] == "running"
+        assert middle["succeeded_count"] == 1
+        assert middle["completed_at"] is None
+
+        second = await jobs.lease(JobKind.CHECKIN, "batch-worker")
+        assert second is not None
+        await jobs.mark_running(UUID(str(second["id"])), str(second["lease_token"]))
+        await jobs.complete(
+            UUID(str(second["id"])), str(second["lease_token"]),
+            status=JobStatus.SUCCEEDED, result={"reason_code": "success"},
+        )
+        completed = await store.get_batch(UUID(str(batch["id"])))
+        assert completed and completed["status"] == "completed"
+        assert completed["succeeded_count"] == 2
+        assert completed["failed_count"] == 0
+        assert completed["completed_at"] is not None
+        assert completed["planned_at"] == planned.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        assert completed["trigger_reason"] == "normal"
+
+        before_updated = completed["updated_at"]
+        assert await store.regenerate_batch(date_key, planned + timedelta(hours=1)) is None
+
+        async def unexpected_regeneration(*_args, **_kwargs):
+            raise AssertionError("completed batch must not enter misfire recovery")
+
+        monkeypatch.setattr(store, "regenerate_batch", unexpected_regeneration)
+        coordinator = ScheduleCoordinator(store, jobs)
+        await coordinator._ensure_and_dispatch_daily_batch(
+            (planned + timedelta(minutes=10)).astimezone(ZoneInfo("Asia/Shanghai")),
+        )
+        unchanged = await store.get_batch(UUID(str(batch["id"])))
+        assert unchanged and unchanged["updated_at"] == before_updated
+        assert unchanged["planned_at"] == completed["planned_at"]
+        assert unchanged["trigger_reason"] == "normal"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_repairs_false_post_completion_batch_regeneration(tmp_path):
+    database_path = tmp_path / "site-hub.db"
+    store = DataLayerStore(database_path)
+    await store.initialize()
+    site = await store.create_site({
+        "name": "Repair site", "url": "https://repair.example", "status": "active",
+    })
+    account = await store.create_account(UUID(str(site["id"])), {
+        "name": "Only", "adapter": "api", "enabled": True,
+    })
+    planned = datetime.now(UTC) - timedelta(seconds=1)
+    date_key = planned.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    batch = await store.create_batch(
+        {"date_key": date_key, "planned_at": planned}, [UUID(str(account["id"]))],
+    )
+    jobs = JobService(store, EventBroker())
+    leased = await jobs.lease(JobKind.CHECKIN, "repair-worker")
+    assert leased is not None
+    await jobs.mark_running(UUID(str(leased["id"])), str(leased["lease_token"]))
+    await jobs.complete(
+        UUID(str(leased["id"])), str(leased["lease_token"]),
+        status=JobStatus.SUCCEEDED, result={"reason_code": "success"},
+    )
+    false_plan = planned + timedelta(hours=1)
+    with store.database.transaction(immediate=True) as conn:
+        conn.execute(
+            """UPDATE job_batches
+               SET status='pending',started_at=NULL,completed_at=NULL,planned_at=?,
+                   trigger_reason='regenerated',updated_at=? WHERE id=?""",
+            (
+                false_plan.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                false_plan.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                str(batch["id"]),
+            ),
+        )
+    await store.close()
+
+    repaired_store = DataLayerStore(database_path)
+    await repaired_store.initialize()
+    try:
+        repaired = await repaired_store.get_batch(UUID(str(batch["id"])))
+        assert repaired and repaired["status"] == "completed"
+        assert repaired["trigger_reason"] == "normal"
+        assert repaired["planned_at"] == planned.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        assert repaired["started_at"] is not None
+        assert repaired["completed_at"] is not None
+        repaired_updated = repaired["updated_at"]
+    finally:
+        await repaired_store.close()
+
+    second_start = DataLayerStore(database_path)
+    await second_start.initialize()
+    try:
+        unchanged = await second_start.get_batch(UUID(str(batch["id"])))
+        assert unchanged and unchanged["updated_at"] == repaired_updated
+    finally:
+        await second_start.close()
 
 
 @pytest.mark.asyncio

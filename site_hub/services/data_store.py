@@ -145,6 +145,7 @@ class DataLayerStore:
                 self._cancel_queued_checkins_locked(
                     conn, now, account_id=account_id,
                 )
+            self._repair_batch_states_locked(conn, now)
         defaults = {
             "scheduler.timezone": "Asia/Shanghai",
             "scheduler.checkin_window_start": "08:00:00",
@@ -730,14 +731,104 @@ class DataLayerStore:
     async def delete_site(self, site_id: UUID) -> bool:
         return await self._call(self._archive_site_sync, _uuid(site_id))
 
-    @staticmethod
+    def _refresh_batch_state_locked(
+        self, conn: sqlite3.Connection, batch_id: str | None, now: str,
+    ) -> None:
+        if not batch_id:
+            return
+        summary = conn.execute(
+            """SELECT b.status,b.started_at,b.completed_at,COUNT(j.id) item_count,
+                      SUM(CASE WHEN j.status='queued' THEN 1 ELSE 0 END) queued_count,
+                      SUM(CASE WHEN j.status IN ('leased','running') THEN 1 ELSE 0 END) active_count,
+                      MIN(j.started_at) first_started_at,MAX(j.finished_at) last_finished_at
+               FROM job_batches b LEFT JOIN jobs j ON j.batch_id=b.id
+               WHERE b.id=? GROUP BY b.id""",
+            (batch_id,),
+        ).fetchone()
+        if summary is None or int(summary["item_count"] or 0) == 0:
+            return
+        if summary["status"] in {"expired", "cancelled"}:
+            return
+        queued = int(summary["queued_count"] or 0)
+        active = int(summary["active_count"] or 0)
+        started_at = summary["started_at"] or summary["first_started_at"]
+        if active or queued:
+            # A batch becomes running as soon as its first job is leased.  A
+            # queued retry keeps the already-started batch open.
+            if active or started_at:
+                status = "running"
+                started_at = started_at or now
+            else:
+                status = "pending"
+            completed_at = None
+        else:
+            status = "completed"
+            started_at = started_at or now
+            completed_at = (
+                summary["completed_at"] or summary["last_finished_at"] or now
+            )
+        if (
+            summary["status"] == status
+            and summary["started_at"] == started_at
+            and summary["completed_at"] == completed_at
+        ):
+            return
+        conn.execute(
+            """UPDATE job_batches
+               SET status=?,started_at=?,completed_at=?,updated_at=? WHERE id=?""",
+            (status, started_at, completed_at, now, batch_id),
+        )
+
+    def _repair_batch_states_locked(
+        self, conn: sqlite3.Connection, now: str,
+    ) -> None:
+        """Repair batch summaries after an interrupted or older application run."""
+        batches = conn.execute(
+            """SELECT b.id,b.planned_at,b.trigger_reason,b.status,b.started_at,
+                      COUNT(DISTINCT j.planned_at) distinct_job_plans,
+                      MIN(j.planned_at) only_job_plan,
+                      SUM(CASE WHEN j.status IN ('queued','leased','running') THEN 1 ELSE 0 END) active_count
+               FROM job_batches b JOIN jobs j ON j.batch_id=b.id
+               GROUP BY b.id"""
+        ).fetchall()
+        for batch in batches:
+            if batch["status"] in {"expired", "cancelled"}:
+                continue
+            # Older builds could apply misfire recovery after every job had
+            # already finished.  In that exact case no job received the new
+            # timestamp, so the original one-shot plan is unambiguous.
+            if (
+                batch["trigger_reason"] == "regenerated"
+                and batch["status"] == "pending"
+                and batch["started_at"] is None
+                and int(batch["active_count"] or 0) == 0
+                and int(batch["distinct_job_plans"] or 0) == 1
+                and batch["only_job_plan"]
+                and batch["only_job_plan"] != batch["planned_at"]
+            ):
+                conn.execute(
+                    """UPDATE job_batches
+                       SET planned_at=?,trigger_reason='normal',updated_at=? WHERE id=?""",
+                    (batch["only_job_plan"], now, batch["id"]),
+                )
+            self._refresh_batch_state_locked(conn, str(batch["id"]), now)
+
     def _cancel_queued_checkins_locked(
-        conn: sqlite3.Connection, now: str, *, site_id: str | None = None,
+        self, conn: sqlite3.Connection, now: str, *, site_id: str | None = None,
         account_id: str | None = None,
     ) -> None:
         if (site_id is None) == (account_id is None):
             raise ValueError("exactly one queued check-in owner is required")
         column, owner_id = ("site_id", site_id) if site_id is not None else ("account_id", account_id)
+        batch_ids = [
+            str(row["batch_id"])
+            for row in conn.execute(
+                f"""SELECT DISTINCT batch_id FROM jobs
+                    WHERE kind='checkin' AND status='queued' AND {column}=?
+                      AND batch_id IS NOT NULL""",
+                (owner_id,),
+            )
+        ]
         conn.execute(
             f"""UPDATE jobs SET status='cancelled',lease_owner=NULL,lease_token=NULL,lease_until=NULL,
                        result_json=?,last_error=NULL,finished_at=?,updated_at=?
@@ -745,6 +836,8 @@ class DataLayerStore:
             (_dumps({"reason_code": "disabled", "cancelled_before_start": True}),
              now, now, owner_id),
         )
+        for batch_id in batch_ids:
+            self._refresh_batch_state_locked(conn, batch_id, now)
 
     @staticmethod
     def _backfill_enabled_browser_account_locked(
@@ -1783,6 +1876,13 @@ class DataLayerStore:
             ).rowcount
             if changed != 1:
                 return None
+            claimed = conn.execute(
+                "SELECT batch_id FROM jobs WHERE id=?", (candidate["id"],),
+            ).fetchone()
+            if claimed and claimed["batch_id"]:
+                self._refresh_batch_state_locked(
+                    conn, str(claimed["batch_id"]), now,
+                )
             row = conn.execute(self._job_select() + " WHERE j.id=?", (candidate["id"],)).fetchone()
             return self._normalize_job(dict(row))
 
@@ -1795,6 +1895,7 @@ class DataLayerStore:
             if not row or row["status"] != "leased" or row["lease_token"] != token:
                 return None
             conn.execute("UPDATE jobs SET status='running',started_at=COALESCE(started_at,?),updated_at=? WHERE id=?", (now, now, job_id))
+            self._refresh_batch_state_locked(conn, row["batch_id"], now)
             run = conn.execute("SELECT id FROM runs WHERE job_id=? AND attempt_no=?", (job_id, row["attempt"])).fetchone()
             if not run:
                 conn.execute(
@@ -1874,6 +1975,7 @@ class DataLayerStore:
                     conn, row=dict(row), run_id=run_id, status=db_status,
                     result=result or {}, error_kind=error_kind, now=now,
                 )
+            self._refresh_batch_state_locked(conn, row["batch_id"], now)
             current = conn.execute(self._job_select() + " WHERE j.id=?", (job_id,)).fetchone()
             return self._normalize_job(dict(current))
 
@@ -1989,6 +2091,7 @@ class DataLayerStore:
                     """UPDATE runs SET status='cancelled',reason_code='cancelled',message='cancelled by user',
                               finished_at=? WHERE job_id=? AND status='running'""", (now, job_id)
                 )
+            self._refresh_batch_state_locked(conn, existing["batch_id"], now)
             row = conn.execute(self._job_select() + " WHERE j.id=?", (job_id,)).fetchone()
             return self._normalize_job(dict(row))
 
@@ -1997,6 +2100,9 @@ class DataLayerStore:
 
     def _retry_sync(self, job_id: str, now: str) -> dict[str, Any] | None:
         with self.database.transaction(immediate=True) as conn:
+            existing = conn.execute(
+                "SELECT batch_id FROM jobs WHERE id=?", (job_id,),
+            ).fetchone()
             changed = conn.execute(
                 """UPDATE jobs SET status='queued',available_at=?,planned_at=?,lease_owner=NULL,
                           lease_token=NULL,lease_until=NULL,progress_json='{}',result_json='{}',last_error=NULL,
@@ -2006,6 +2112,9 @@ class DataLayerStore:
             ).rowcount
             if not changed:
                 return None
+            self._refresh_batch_state_locked(
+                conn, existing["batch_id"] if existing else None, now,
+            )
             row = conn.execute(self._job_select() + " WHERE j.id=?", (job_id,)).fetchone()
             return self._normalize_job(dict(row))
 
@@ -2017,10 +2126,13 @@ class DataLayerStore:
             ids = [row["id"] for row in conn.execute(
                 "SELECT id FROM jobs WHERE status IN ('leased','running') AND lease_until IS NOT NULL AND lease_until<=?", (now,)
             )]
+            batch_ids: set[str] = set()
             for job_id in ids:
                 job_row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
                 if job_row is None:
                     continue
+                if job_row["batch_id"]:
+                    batch_ids.add(str(job_row["batch_id"]))
                 terminal = int(job_row["attempt"]) >= int(job_row["max_attempts"])
                 conn.execute(
                     """UPDATE jobs SET status=CASE WHEN attempt>=max_attempts THEN 'effect_unknown' ELSE 'queued' END,
@@ -2046,6 +2158,8 @@ class DataLayerStore:
                         status="effect_unknown", result={"reason_code": "worker_lost"},
                         error_kind="worker_lost", now=now,
                     )
+            for batch_id in batch_ids:
+                self._refresh_batch_state_locked(conn, batch_id, now)
             return [self._normalize_job(dict(row)) for row in conn.execute(
                 self._job_select() + (" WHERE j.id IN (%s)" % ",".join("?" for _ in ids)), ids
             )] if ids else []
@@ -2145,37 +2259,84 @@ class DataLayerStore:
     def _create_batch_sync(self, payload: dict[str, Any], account_ids: list[UUID]) -> dict[str, Any]:
         date_key = str(payload["date_key"])
         planned = _iso(payload["planned_at"])
-        batch = self.repository.create_batch(business_date=date_key, planned_at=planned)
-        for account_id in account_ids:
-            account = _uuid(account_id)
-            with self.database.connect() as conn:
+        batch_id = str(uuid4())
+        now = _iso(datetime.now(UTC))
+        with self.database.transaction(immediate=True) as conn:
+            conn.execute(
+                """INSERT INTO job_batches(
+                       id,schedule_id,business_date,timezone,planned_at,trigger_reason,status,
+                       created_at,updated_at
+                   ) VALUES(?,NULL,?,'Asia/Shanghai',?,'normal','pending',?,?)""",
+                (batch_id, date_key, planned, now, now),
+            )
+            for account_id in account_ids:
+                account = _uuid(account_id)
                 capability = conn.execute(
-                    "SELECT id FROM capability_instances WHERE account_id=? AND code='checkin' AND enabled=1", (account,)
+                    """SELECT id,site_id FROM capability_instances
+                       WHERE account_id=? AND code='checkin' AND enabled=1""",
+                    (account,),
                 ).fetchone()
-            if capability:
-                try:
-                    self.repository.create_job(
-                        capability_instance_id=capability["id"], batch_id=batch["id"], business_date=date_key,
-                        planned_at=planned, available_at=planned, priority=50, max_attempts=3,
-                        idempotency_key=f"checkin:{account}:{date_key}",
-                        payload={"batch_id": batch["id"]},
-                    )
-                except sqlite3.IntegrityError:
-                    pass
-        return self._normalize_batch(batch)
+                if capability:
+                    try:
+                        conn.execute(
+                            """INSERT INTO jobs(
+                                   id,batch_id,kind,site_id,account_id,capability_instance_id,
+                                   business_date,planned_at,available_at,priority,status,max_attempts,
+                                   idempotency_key,payload_json,created_at,updated_at
+                               ) VALUES(?,?,'checkin',?,?,?,?,?,?,50,'queued',3,?,?,?,?)""",
+                            (
+                                str(uuid4()), batch_id, capability["site_id"], account,
+                                capability["id"], date_key, planned, planned,
+                                f"checkin:{account}:{date_key}",
+                                _dumps({"batch_id": batch_id}), now, now,
+                            ),
+                        )
+                    except sqlite3.IntegrityError:
+                        if not conn.execute(
+                            "SELECT 1 FROM jobs WHERE idempotency_key=?",
+                            (f"checkin:{account}:{date_key}",),
+                        ).fetchone():
+                            raise
+            batch = conn.execute(
+                "SELECT * FROM job_batches WHERE id=?", (batch_id,),
+            ).fetchone()
+        return self._normalize_batch(dict(batch))
 
     async def regenerate_batch(self, date_key: str, planned_at: datetime) -> dict[str, Any] | None:
         return await self._call(self._regenerate_batch_sync, date_key, _iso(planned_at))
 
     def _regenerate_batch_sync(self, date_key: str, planned: str) -> dict[str, Any] | None:
-        batch = self._get_batch_for_date(date_key)
-        if not batch:
-            return None
         now = _iso(datetime.now(UTC))
         with self.database.transaction(immediate=True) as conn:
-            conn.execute("UPDATE job_batches SET planned_at=?,trigger_reason='regenerated',updated_at=? WHERE id=?", (planned, now, batch["id"]))
-            conn.execute("UPDATE jobs SET planned_at=?,available_at=?,updated_at=? WHERE batch_id=? AND status='queued'", (planned, planned, now, batch["id"]))
-            row = conn.execute("SELECT * FROM job_batches WHERE id=?", (batch["id"],)).fetchone()
+            batch = conn.execute(
+                """SELECT * FROM job_batches
+                   WHERE business_date=? AND status!='cancelled'
+                   ORDER BY created_at DESC LIMIT 1""",
+                (date_key,),
+            ).fetchone()
+            if (
+                batch is None
+                or batch["status"] != "pending"
+                or batch["started_at"] is not None
+                or conn.execute(
+                    "SELECT 1 FROM jobs WHERE batch_id=? AND status!='queued' LIMIT 1",
+                    (batch["id"],),
+                ).fetchone()
+            ):
+                return None
+            conn.execute(
+                """UPDATE job_batches
+                   SET planned_at=?,trigger_reason='regenerated',updated_at=? WHERE id=?""",
+                (planned, now, batch["id"]),
+            )
+            conn.execute(
+                """UPDATE jobs SET planned_at=?,available_at=?,updated_at=?
+                   WHERE batch_id=? AND status='queued'""",
+                (planned, planned, now, batch["id"]),
+            )
+            row = conn.execute(
+                "SELECT * FROM job_batches WHERE id=?", (batch["id"],),
+            ).fetchone()
         return self._normalize_batch(dict(row))
 
     async def list_batch_items(self, batch_id: UUID) -> list[dict[str, Any]]:
