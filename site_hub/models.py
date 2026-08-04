@@ -216,6 +216,60 @@ class ProductSettingsOut(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProductCategoryCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    sort_order: int = Field(default=0, ge=0, le=1_000_000)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("category name must not be blank")
+        return value
+
+
+class ProductCategoryUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    sort_order: int | None = Field(default=None, ge=0, le=1_000_000)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str | None) -> str | None:
+        if value is None:
+            raise ValueError("category name must not be null")
+        value = value.strip()
+        if not value:
+            raise ValueError("category name must not be blank")
+        return value
+
+    @field_validator("sort_order")
+    @classmethod
+    def reject_null_sort_order(cls, value: int | None) -> int | None:
+        if value is None:
+            raise ValueError("category sort order must not be null")
+        return value
+
+
+class ProductCategoryAssignment(BaseModel):
+    category_id: UUID | None = None
+    category_mode: Literal["manual", "automatic"] = "manual"
+
+    @model_validator(mode="after")
+    def validate_category_mode(self):
+        if self.category_mode == "automatic" and self.category_id is not None:
+            raise ValueError("automatic category mode cannot include category_id")
+        return self
+
+
+class BackupCreateRequest(BaseModel):
+    label: str | None = Field(default=None, max_length=200)
+
+
+class BackupRestoreRequest(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=128)
+
+
 class JobOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID

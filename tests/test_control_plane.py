@@ -715,7 +715,9 @@ async def test_product_capability_always_has_a_synchronized_interval_schedule(tm
 
         due = await store.list_due_product_sites(datetime.now(UTC))
         due_ids = {str(item["site_id"]) for item in due}
-        assert str(created_with_product["id"]) in due_ids
+        # The interval schedule remains enabled and visible, but a site without
+        # an automatic scraper must not manufacture hourly skipped jobs.
+        assert str(created_with_product["id"]) not in due_ids
         assert str(bookmark_only["id"]) in due_ids
 
         disabled = await store.update_product_settings(

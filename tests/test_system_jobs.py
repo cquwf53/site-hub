@@ -59,6 +59,47 @@ async def wait_for_job(store, job_id: UUID, statuses: set[str], timeout: float =
 
 
 @pytest.mark.asyncio
+async def test_schedule_listing_includes_latest_job_state(tmp_path):
+    store = DataLayerStore(tmp_path / "site-hub.db")
+    await store.initialize()
+    try:
+        site = await store.create_site({
+            "name": "Shop", "url": "https://shop.example", "status": "active",
+            "capabilities": ["product_monitor"],
+        })
+        site_id = UUID(str(site["id"]))
+        await store.update_product_settings(site_id, {"enabled": True})
+        jobs = JobService(store, EventBroker())
+        completed_task, created = await jobs.enqueue_product_sync(site_id)
+        assert created is True
+        leased = await jobs.lease(JobKind.PRODUCT_SYNC, "schedule-list-test")
+        assert leased is not None
+        lease_token = str(leased["lease_token"])
+        await jobs.mark_running(completed_task.job_id, lease_token)
+        await jobs.complete(
+            completed_task.job_id,
+            lease_token,
+            status=JobStatus.SUCCEEDED,
+            result={"created": 1},
+        )
+        current_task, created = await jobs.enqueue_product_sync(site_id)
+        assert created is True
+
+        schedules, total = await store.list_schedules(
+            page=1, page_size=20, capability="product_monitor",
+        )
+        assert total == 1
+        assert schedules[0]["current_job_id"] == str(current_task.job_id)
+        assert schedules[0]["current_status"] == "queued"
+        assert schedules[0]["last_job_id"] == str(completed_task.job_id)
+        assert schedules[0]["last_status"] == "succeeded"
+        assert schedules[0]["last_run_at"] is not None
+        assert schedules[0]["last_error_message"] is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_global_adapter_job_is_durable_and_visible_in_run_history(tmp_path):
     store = DataLayerStore(tmp_path / "site-hub.db")
     await store.initialize()

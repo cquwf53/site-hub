@@ -14,6 +14,15 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _moment(value: datetime | str) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+        str(value).replace("Z", "+00:00")
+    )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def _public_config(value: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Mirror the public-store contract without retaining test secrets."""
     markers = (
@@ -61,6 +70,10 @@ class MemoryStore:
         self.sites: dict[UUID, dict[str, Any]] = {}
         self.accounts: dict[UUID, dict[str, Any]] = {}
         self.product_settings: dict[UUID, dict[str, Any]] = {}
+        self.product_schedules: dict[UUID, dict[str, Any]] = {}
+        self.product_categories: dict[UUID, dict[str, Any]] = {}
+        self.products: dict[UUID, dict[str, Any]] = {}
+        self.price_observations: dict[UUID, dict[str, Any]] = {}
         self.jobs: dict[UUID, dict[str, Any]] = {}
         self.batches: dict[str, dict[str, Any]] = {}
         self.batch_items: dict[UUID, list[dict[str, Any]]] = {}
@@ -100,6 +113,8 @@ class MemoryStore:
                    "updated_at": None, **payload}
             row.pop("tag_ids", None)
             self.sites[site_id] = row
+            if "product_monitor" in set(payload.get("capabilities") or []):
+                self._ensure_product_schedule(site_id)
             return deepcopy(row)
 
     async def update_site(self, site_id, payload):
@@ -266,6 +281,31 @@ class MemoryStore:
         row["updated_at"] = _now().isoformat()
         return deepcopy(row)
 
+    def _ensure_product_schedule(self, site_id: UUID) -> tuple[dict[str, Any], dict[str, Any]]:
+        interval = int(self.settings["scheduler.product_interval_minutes"])
+        settings = self.product_settings.setdefault(site_id, {
+            "site_id": site_id, "enabled": False, "interval_override_minutes": None,
+            "interval_minutes": interval, "effective_interval_minutes": interval,
+            "scraper_type": "none", "configured": False,
+            "configured_secret_fields": [], "config": {},
+        })
+        schedule = self.product_schedules.setdefault(site_id, {
+            "id": uuid4(), "site_id": site_id, "enabled": False,
+            "timezone": "Asia/Shanghai", "policy_type": "interval",
+            "next_run_at": None, "misfire_policy": "recover", "max_attempts": 1,
+            "created_at": _now().isoformat(), "updated_at": _now().isoformat(),
+        })
+        return settings, schedule
+
+    @staticmethod
+    def _automatic_product_support(scraper_type: Any) -> tuple[bool, str | None]:
+        normalized = str(scraper_type or "none").strip().casefold()
+        if normalized == "manual":
+            return False, "manual_catalog"
+        if normalized in {"", "none"}:
+            return False, "scraper_not_configured"
+        return True, None
+
     async def get_product_settings(self, site_id):
         site_id = UUID(str(site_id))
         if site_id not in self.sites or self.sites[site_id].get("status") == "archived":
@@ -284,10 +324,7 @@ class MemoryStore:
         site_id = UUID(str(site_id))
         if site_id not in self.sites or self.sites[site_id].get("status") == "archived":
             raise LookupError("site not found")
-        row = self.product_settings.setdefault(site_id, {"site_id": site_id, "enabled": False,
-            "interval_override_minutes": None, "effective_interval_minutes": 60,
-            "scraper_type": "none", "configured": False, "configured_secret_fields": [],
-            "config": {}})
+        row, schedule = self._ensure_product_schedule(site_id)
         payload = dict(payload)
         clear_secrets = set(payload.pop("clear_secrets", []) or [])
         if "config" in payload:
@@ -305,9 +342,216 @@ class MemoryStore:
         row.update(payload)
         row["effective_interval_minutes"] = row.get("interval_override_minutes") or int(self.settings["scheduler.product_interval_minutes"])
         row["interval_minutes"] = row["effective_interval_minutes"]
+        schedule.update(
+            enabled=bool(row.get("enabled")), updated_at=_now().isoformat(),
+        )
         return deepcopy(row)
-    async def list_due_product_sites(self, now): return []
-    async def mark_product_enqueued(self, site_id, next_run_at): pass
+
+    async def get_product_runtime(self, site_id):
+        row = await self.get_product_settings(site_id)
+        if row is None:
+            return None
+        row["runtime_config"] = deepcopy(row.get("config") or {})
+        return row
+
+    def _public_product(self, raw: dict[str, Any]) -> dict[str, Any]:
+        row = deepcopy(raw)
+        site_id = UUID(str(row["site_id"]))
+        category_id = row.get("category_id")
+        category = self.product_categories.get(UUID(str(category_id))) if category_id else None
+        scraped_category_id = row.get("scraped_category_id")
+        scraped_category = (
+            self.product_categories.get(UUID(str(scraped_category_id)))
+            if scraped_category_id else None
+        )
+        row["id"] = UUID(str(row["id"]))
+        row["site_id"] = site_id
+        row["site_name"] = self.sites.get(site_id, {}).get("name")
+        row["category_id"] = UUID(str(category_id)) if category_id else None
+        row["category_name"] = category.get("name") if category else None
+        row["scraped_category_id"] = UUID(str(scraped_category_id)) if scraped_category_id else None
+        row["scraped_category_name"] = scraped_category.get("name") if scraped_category else None
+        row["category_overridden"] = bool(row.get("category_overridden", False))
+        row.setdefault("raw_tags", deepcopy(row.pop("raw_tags_json", [])))
+        return row
+
+    async def list_products(self, *, page, page_size, site_id=None, q=None,
+                            availability_status=None, category_id=None):
+        rows = list(self.products.values())
+        if site_id is not None:
+            wanted_site = UUID(str(site_id))
+            rows = [row for row in rows if UUID(str(row["site_id"])) == wanted_site]
+        if category_id is not None:
+            wanted_category = UUID(str(category_id))
+            rows = [row for row in rows if row.get("category_id") and UUID(str(row["category_id"])) == wanted_category]
+        if q:
+            needle = str(q).casefold()
+            rows = [row for row in rows if needle in str(row.get("name") or "").casefold()
+                    or needle in str(row.get("external_key") or "").casefold()]
+        if availability_status:
+            rows = [row for row in rows if row.get("availability_status") == availability_status]
+        rows.sort(key=lambda row: (str(row.get("updated_at") or ""), str(row["id"])), reverse=True)
+        start = (page - 1) * page_size
+        return [self._public_product(row) for row in rows[start:start + page_size]], len(rows)
+
+    async def get_product(self, product_id):
+        row = self.products.get(UUID(str(product_id)))
+        if row is None:
+            return None
+        result = self._public_product(row)
+        result.setdefault("tags", [])
+        history = [item for item in self.price_observations.values()
+                   if UUID(str(item["product_id"])) == UUID(str(product_id))]
+        prices = [float(item["price"]) for item in history if item.get("price") is not None]
+        observed = [_moment(item["observed_at"]) for item in history]
+        result["price_history_summary"] = {
+            "observation_count": len(history),
+            "min_price": min(prices) if prices else None,
+            "max_price": max(prices) if prices else None,
+            "first_observed_at": min(observed).isoformat() if observed else None,
+            "last_observed_at": max(observed).isoformat() if observed else None,
+        }
+        return result
+
+    async def list_product_price_history(self, product_id, *, page, page_size,
+                                         date_from=None, date_to=None):
+        wanted = UUID(str(product_id))
+        if wanted not in self.products:
+            return None
+        lower = _moment(date_from) if date_from is not None else None
+        upper = _moment(date_to) if date_to is not None else None
+        rows = [deepcopy(item) for item in self.price_observations.values()
+                if UUID(str(item["product_id"])) == wanted]
+        if lower is not None:
+            rows = [row for row in rows if _moment(row["observed_at"]) >= lower]
+        if upper is not None:
+            rows = [row for row in rows if _moment(row["observed_at"]) <= upper]
+        rows.sort(key=lambda row: (_moment(row["observed_at"]), str(row["id"])), reverse=True)
+        start = (page - 1) * page_size
+        return rows[start:start + page_size], len(rows)
+
+    def _public_product_category(self, raw: dict[str, Any]) -> dict[str, Any]:
+        row = deepcopy(raw)
+        site_id = UUID(str(row["site_id"]))
+        category_id = UUID(str(row["id"]))
+        row.update(
+            id=category_id, site_id=site_id,
+            site_name=self.sites.get(site_id, {}).get("name"),
+            product_count=sum(
+                1 for product in self.products.values()
+                if product.get("category_id") and UUID(str(product["category_id"])) == category_id
+            ),
+        )
+        return row
+
+    async def list_product_categories(self, *, page, page_size, site_id=None, q=None):
+        rows = list(self.product_categories.values())
+        if site_id is not None:
+            wanted = UUID(str(site_id))
+            rows = [row for row in rows if UUID(str(row["site_id"])) == wanted]
+        if q:
+            needle = str(q).casefold()
+            rows = [row for row in rows if needle in str(row["name"]).casefold()
+                    or needle in str(self.sites.get(UUID(str(row["site_id"])), {}).get("name") or "").casefold()]
+        rows.sort(key=lambda row: (
+            str(self.sites.get(UUID(str(row["site_id"])), {}).get("name") or "").casefold(),
+            int(row.get("sort_order", 0)), str(row["name"]).casefold(), str(row["id"]),
+        ))
+        start = (page - 1) * page_size
+        return [self._public_product_category(row) for row in rows[start:start + page_size]], len(rows)
+
+    async def create_product_category(self, site_id, payload):
+        site_id = UUID(str(site_id))
+        if site_id not in self.sites or self.sites[site_id].get("status") == "archived":
+            return None
+        name = str(payload["name"]).strip()
+        async with self._lock:
+            if any(UUID(str(row["site_id"])) == site_id and str(row["name"]).casefold() == name.casefold()
+                   for row in self.product_categories.values()):
+                raise ValueError("A category with this name already exists for the site")
+            now = _now().isoformat(); category_id = uuid4()
+            row = {"id": category_id, "site_id": site_id, "name": name,
+                   "source_name": None,
+                   "sort_order": int(payload.get("sort_order", 0)),
+                   "created_at": now, "updated_at": now}
+            self.product_categories[category_id] = row
+            return self._public_product_category(row)
+
+    async def update_product_category(self, category_id, payload):
+        category_id = UUID(str(category_id))
+        async with self._lock:
+            row = self.product_categories.get(category_id)
+            if row is None:
+                return None
+            if payload.get("name") is None and "name" in payload:
+                raise ValueError("category name must not be null")
+            if payload.get("sort_order") is None and "sort_order" in payload:
+                raise ValueError("category sort order must not be null")
+            name = str(payload.get("name", row["name"])).strip()
+            if any(other_id != category_id and UUID(str(other["site_id"])) == UUID(str(row["site_id"]))
+                   and str(other["name"]).casefold() == name.casefold()
+                   for other_id, other in self.product_categories.items()):
+                raise ValueError("A category with this name already exists for the site")
+            row.update(name=name, sort_order=int(payload.get("sort_order", row["sort_order"])),
+                       updated_at=_now().isoformat())
+            return self._public_product_category(row)
+
+    async def delete_product_category(self, category_id):
+        category_id = UUID(str(category_id))
+        async with self._lock:
+            if self.product_categories.pop(category_id, None) is None:
+                return False
+            for product in self.products.values():
+                if product.get("category_id") and UUID(str(product["category_id"])) == category_id:
+                    product["category_id"] = None
+                    product["updated_at"] = _now().isoformat()
+                if product.get("scraped_category_id") and UUID(str(product["scraped_category_id"])) == category_id:
+                    product["scraped_category_id"] = None
+            return True
+
+    async def assign_product_category(self, product_id, category_id, *, automatic=False):
+        product_id = UUID(str(product_id))
+        wanted_category = UUID(str(category_id)) if category_id else None
+        async with self._lock:
+            product = self.products.get(product_id)
+            if product is None:
+                return None
+            if wanted_category is not None and not automatic:
+                category = self.product_categories.get(wanted_category)
+                if category is None:
+                    raise LookupError("Product category not found")
+                if UUID(str(category["site_id"])) != UUID(str(product["site_id"])):
+                    raise ValueError("A product can only use a category from the same site")
+            product["category_id"] = (
+                product.get("scraped_category_id") if automatic else wanted_category
+            )
+            product["category_overridden"] = not automatic
+            product["updated_at"] = _now().isoformat()
+            return self._public_product(product)
+
+    async def list_due_product_sites(self, now):
+        current = _moment(now)
+        rows = []
+        for site_id, schedule in self.product_schedules.items():
+            settings = self.product_settings.get(site_id) or {}
+            next_run = schedule.get("next_run_at")
+            if not settings.get("enabled") or not schedule.get("enabled"):
+                continue
+            supported, _ = self._automatic_product_support(settings.get("scraper_type"))
+            if not supported:
+                continue
+            if next_run is not None and _moment(next_run) > current:
+                continue
+            rows.append({
+                "site_id": site_id,
+                "interval_override_minutes": settings.get("interval_override_minutes"),
+            })
+        return deepcopy(rows)
+
+    async def mark_product_enqueued(self, site_id, next_run_at):
+        site_id = UUID(str(site_id))
+        _, schedule = self._ensure_product_schedule(site_id)
+        schedule.update(next_run_at=next_run_at, updated_at=_now().isoformat())
 
     async def enqueue_job(self, payload):
         async with self._lock:
@@ -424,17 +668,75 @@ class MemoryStore:
         for account in self.accounts.values():
             if account.get("auth_state") == "disabled": continue
             policy = account.get("schedule_override") or {"mode": "daily_random_window"}
+            policy_type = "daily_random_window" if policy.get("mode") == "daily_random_window" else "cron"
             rows.append({
                 "id": str(account["id"]), "capability": "checkin",
                 "site_id": account["site_id"], "account_id": account["id"],
+                "site_name": self.sites.get(UUID(str(account["site_id"])), {}).get("name"),
+                "account_label": account.get("label") or account.get("name"),
                 "timezone": policy.get("timezone", "Asia/Shanghai"),
+                "policy_type": policy_type,
                 "policy": deepcopy(policy), "enabled": bool(account.get("enabled", True)),
                 "next_run_at": None,
+                "automatic_run_supported": True, "automatic_run_reason": None,
+            })
+        for site_id, schedule in self.product_schedules.items():
+            settings = self.product_settings.get(site_id) or {}
+            scraper_type = str(settings.get("scraper_type") or "none")
+            supported, reason = self._automatic_product_support(scraper_type)
+            candidates = [job for job in self.jobs.values()
+                          if job.get("kind") == "product_sync"
+                          and job.get("site_id") is not None
+                          and UUID(str(job["site_id"])) == site_id]
+            active = max(
+                (job for job in candidates if job.get("status") in {"queued", "leased", "running"}),
+                key=lambda job: (_moment(job["created_at"]), str(job["id"])),
+                default=None,
+            )
+            latest = max(
+                (job for job in candidates if job.get("status") in {
+                    "succeeded", "failed", "skipped", "cancelled", "effect_unknown",
+                }),
+                key=lambda job: (_moment(job["created_at"]), str(job["id"])),
+                default=None,
+            )
+            interval = int(settings.get("interval_override_minutes")
+                           or self.settings["scheduler.product_interval_minutes"])
+            rows.append({
+                "id": str(schedule["id"]), "capability": "product_monitor",
+                "site_id": site_id, "site_name": self.sites.get(site_id, {}).get("name"),
+                "account_id": None, "account_label": None,
+                "timezone": schedule.get("timezone", "Asia/Shanghai"),
+                "policy_type": "interval",
+                "policy": {
+                    "minutes": interval,
+                    "override": settings.get("interval_override_minutes") is not None,
+                },
+                "enabled": bool(schedule.get("enabled") and settings.get("enabled")),
+                "next_run_at": schedule.get("next_run_at"),
+                "misfire_policy": schedule.get("misfire_policy", "recover"),
+                "max_attempts": schedule.get("max_attempts", 1),
+                "scraper_type": scraper_type,
+                "automatic_run_supported": supported,
+                "automatic_run_reason": reason,
+                "current_job_id": str(active["id"]) if active else None,
+                "current_status": active.get("status") if active else None,
+                "current_job_at": active.get("created_at") if active else None,
+                "last_job_id": str(latest["id"]) if latest else None,
+                "last_status": latest.get("status") if latest else None,
+                "last_run_at": latest.get("finished_at") if latest else None,
+                "last_error_kind": latest.get("error_kind") if latest else None,
+                "last_error_message": latest.get("error_message") if latest else None,
             })
         if capability: rows = [row for row in rows if row["capability"] == capability]
         if enabled is not None: rows = [row for row in rows if row["enabled"] is enabled]
+        rows.sort(key=lambda row: (
+            not bool(row["enabled"]), row.get("next_run_at") is None,
+            str(row.get("next_run_at") or ""), str(row.get("site_name") or "").casefold(),
+            str(row.get("account_label") or "").casefold(), str(row["id"]),
+        ))
         start = (page - 1) * page_size
-        return rows[start:start + page_size], len(rows)
+        return deepcopy(rows[start:start + page_size]), len(rows)
 
     async def list_folders(self):
         return deepcopy(sorted(self.folders.values(), key=lambda row: (row["parent_id"] is not None, str(row["parent_id"] or ""), row["sort_order"], row["name"].casefold())))

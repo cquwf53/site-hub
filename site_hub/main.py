@@ -25,6 +25,7 @@ from site_hub.notifications import (
 )
 from site_hub.scrapers.network import sanitize_log_value
 from site_hub.scheduling.coordinator import ScheduleCoordinator
+from site_hub.services.backups import BackupService
 from site_hub.services.data_store import DataLayerStore
 from site_hub.services.ports import AccountNotReady
 from site_hub.services.events import EventBroker
@@ -59,6 +60,7 @@ def create_app(*, settings: Settings | None = None, store: Store | None = None,
         jobs, product_handler=product_handler, product_concurrency=runtime.scrape_concurrency,
     )
     bookmark_staging = BookmarkStaging(runtime.data_dir / "staging")
+    backups = BackupService(runtime.data_dir)
     system_dispatcher = SystemJobDispatcher(
         jobs, supervisor=supervisor, staging=bookmark_staging,
     )
@@ -68,25 +70,53 @@ def create_app(*, settings: Settings | None = None, store: Store | None = None,
     async def lifespan(app: FastAPI):
         instance_lock.acquire()
         store_initialized = False
+        restored = None
         scheduler_started = dispatcher_started = system_dispatcher_started = supervisor_started = False
         notification_task: asyncio.Task[None] | None = None
         notification_stop = asyncio.Event()
         try:
             runtime.prepare_directories()
-            await durable_store.initialize()
-            store_initialized = True
-            await jobs.recover()
-            database = getattr(durable_store, "database", None)
-            secret_service = getattr(durable_store, "secret_service", None)
-            if database is not None and secret_service is not None:
-                channel_service = NotificationChannelService(database, secret_service)
-                outbox_store = NotificationOutboxStore(database)
-                notification_executor = NotificationOutboxExecutor(
-                    outbox_store, secret_service
+            # Startup is not accepting requests yet, so keep this synchronous.
+            # A detached restore thread could outlive lifespan cancellation and
+            # the process mutex, allowing a second instance to touch the DB.
+            restored = backups.apply_pending_restore_with_instance_lock()
+            if restored is not None:
+                logger.info(
+                    "restored database backup %s; rollback backup %s",
+                    restored.restored_backup.backup_id,
+                    restored.rollback_backup.backup_id,
                 )
-                app.state.notification_channels = channel_service
-                app.state.notification_executor = notification_executor
-                await asyncio.to_thread(outbox_store.recover_expired)
+            try:
+                await durable_store.initialize()
+                store_initialized = True
+                await jobs.recover()
+                database = getattr(durable_store, "database", None)
+                secret_service = getattr(durable_store, "secret_service", None)
+                if database is not None and secret_service is not None:
+                    channel_service = NotificationChannelService(database, secret_service)
+                    outbox_store = NotificationOutboxStore(database)
+                    notification_executor = NotificationOutboxExecutor(
+                        outbox_store, secret_service
+                    )
+                    app.state.notification_channels = channel_service
+                    app.state.notification_executor = notification_executor
+                    await asyncio.to_thread(outbox_store.recover_expired)
+                if restored is not None:
+                    backups.confirm_pending_restore(restored.restored_backup.backup_id)
+            except BaseException:
+                if restored is not None:
+                    # Database connections are short-lived, but close the store
+                    # contract before replacing the file and keep the process
+                    # lock held throughout rollback.
+                    try:
+                        await durable_store.close()
+                    finally:
+                        store_initialized = False
+                    backups.rollback_applied_restore_with_instance_lock(restored)
+                    logger.exception(
+                        "restored database failed startup validation; original database rolled back"
+                    )
+                raise
             if start_background:
                 supervisor.start(); supervisor_started = True
                 scheduler.start(); scheduler_started = True
@@ -139,6 +169,7 @@ def create_app(*, settings: Settings | None = None, store: Store | None = None,
     app.state.dispatcher = dispatcher
     app.state.system_dispatcher = system_dispatcher
     app.state.bookmark_staging = bookmark_staging
+    app.state.backups = backups
     app.state.notification_channels = None
     app.state.notification_executor = None
     app.state.notification_task = None
