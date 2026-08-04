@@ -167,6 +167,11 @@ class SystemJobDispatcher:
             await self.service.mark_running(job_id, token)
             heartbeat = asyncio.create_task(self._heartbeat(job_id, token), name=f"system-heartbeat-{job_id}")
             result = await self._execute(job)
+            # A terminal job must not become visible before its sensitive
+            # upload staging file is gone.  Otherwise a fast API poll can see
+            # ``succeeded`` while the cleanup in ``finally`` is still pending.
+            if job["kind"] == JobKind.BOOKMARK_IMPORT.value:
+                await self.staging.cleanup(job.get("payload") or {})
             completed = await self.service.complete(job_id, token, status=JobStatus.SUCCEEDED, result=result)
             terminal = completed["status"] != JobStatus.QUEUED.value
         except SystemExecutionError as exc:

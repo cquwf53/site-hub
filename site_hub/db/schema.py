@@ -376,7 +376,23 @@ V1_STATEMENTS = (
     )""",
 )
 
-MIGRATIONS = (Migration(1, "initial-unified-schema", V1_STATEMENTS),)
+V2_STATEMENTS = (
+    # Keep the scraper's category separate from the user's effective choice.
+    # Existing imported products initially follow their current category.
+    "ALTER TABLE product_categories ADD COLUMN source_name TEXT",
+    "ALTER TABLE products ADD COLUMN scraped_category_id TEXT REFERENCES product_categories(id) ON DELETE SET NULL",
+    "ALTER TABLE products ADD COLUMN category_overridden INTEGER NOT NULL DEFAULT 0 CHECK(category_overridden IN (0,1))",
+    "UPDATE product_categories SET source_name=name",
+    "UPDATE products SET scraped_category_id=category_id",
+    "CREATE INDEX idx_products_scraped_category ON products(site_id, scraped_category_id, id)",
+    "CREATE INDEX idx_jobs_capability_status_created ON jobs(capability_instance_id, status, created_at DESC, id DESC)",
+)
+
+
+MIGRATIONS = (
+    Migration(1, "initial-unified-schema", V1_STATEMENTS),
+    Migration(2, "preserve-manual-product-categories", V2_STATEMENTS),
+)
 SCHEMA_VERSION = MIGRATIONS[-1].version
 
 

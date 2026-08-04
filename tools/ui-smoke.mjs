@@ -137,7 +137,17 @@ async function main() {
     await page.locator('.sidebar-foot .presence-dot.online').waitFor({ state: 'visible' })
 
     await navigate('.primary-nav a[href="/sites"]', '/sites', '.sites-layout', 'sites')
+    await navigate('.primary-nav a[href="/products"]', '/products', '.product-toolbar', 'products')
+    const firstProduct = page.locator('.product-name-button').first()
+    if (await firstProduct.count()) {
+      await firstProduct.click()
+      await waitForPage('.modal-card .product-detail', 'product details and price history')
+      await page.locator('.modal-card button[aria-label="关闭"]').click()
+      await page.locator('.modal-card').waitFor({ state: 'detached' })
+    }
     await navigate('.primary-nav a[href="/settings/general"]', '/settings/general', '.settings-layout', 'settings')
+    await navigate('.section-tabs a[href="/settings/schedules"]', '/settings/schedules', '.schedule-settings', 'schedule settings')
+    await navigate('.section-tabs a[href="/settings/data"]', '/settings/data', '.backup-table', 'backup settings')
     await navigate('.section-tabs a[href="/settings/notifications"]', '/settings/notifications', '.settings-content section.card', 'notification settings')
     await navigate('.primary-nav a[href="/automations/jobs"]', '/automations/jobs', '.automation-tabs + .toolbar', 'automation jobs')
 

@@ -6,7 +6,7 @@ import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -15,8 +15,13 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from site_hub.jobs.service import JobConflict, JobNotFound, JobService
 from site_hub.models import (
+    BackupCreateRequest, BackupRestoreRequest,
     CheckinAccountCreate, CheckinAccountUpdate, JobKind, JobStatus,
+    ProductCategoryAssignment, ProductCategoryCreate, ProductCategoryUpdate,
     ProductSettingsUpdate, ScheduleSettingsUpdate, SiteCreate, SiteUpdate,
+)
+from site_hub.services.backups import (
+    BackupError, BackupNotFoundError, BackupPathError, BackupValidationError,
 )
 
 
@@ -29,6 +34,25 @@ def _store(request: Request):
 
 def _jobs(request: Request) -> JobService:
     return request.app.state.jobs
+
+
+def _backups(request: Request):
+    return request.app.state.backups
+
+
+def _raise_backup_error(exc: Exception) -> None:
+    if isinstance(exc, BackupNotFoundError):
+        status, code = 404, "BACKUP_NOT_FOUND"
+    elif isinstance(exc, BackupPathError):
+        status, code = 400, "INVALID_BACKUP_PATH"
+    elif isinstance(exc, BackupValidationError):
+        status, code = 409, "BACKUP_INVALID"
+    else:
+        status, code = 503, "BACKUP_UNAVAILABLE"
+    raise HTTPException(
+        status,
+        detail={"code": code, "message": str(exc)},
+    ) from None
 
 
 def _notification_channels(request: Request):
@@ -259,12 +283,132 @@ async def open_endpoint(request: Request, endpoint_id: UUID):
 @router.get("/products")
 async def list_products(request: Request, page: int = Query(1, ge=1),
                         page_size: int = Query(20, ge=1, le=200), site_id: UUID | None = None,
-                        q: str | None = None, availability_status: str | None = None):
+                        q: str | None = Query(None, max_length=200),
+                        availability_status: Literal[
+                            "available", "sold_out", "missing", "delisted", "unknown"
+                        ] | None = None,
+                        category_id: UUID | None = None):
     method = getattr(_store(request), "list_products", None)
     if not method: return _page([], page, page_size, 0)
     items, total = await method(page=page, page_size=page_size, site_id=site_id, q=q,
-                                availability_status=availability_status)
+                                availability_status=availability_status, category_id=category_id)
     return _page(items, page, page_size, total)
+
+
+@router.get("/products/{product_id}")
+async def get_product(request: Request, product_id: UUID):
+    row = await _store(request).get_product(product_id)
+    if not row:
+        _not_found("Product not found")
+    return row
+
+
+@router.get("/products/{product_id}/price-history")
+async def product_price_history(
+    request: Request, product_id: UUID, page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=200),
+    date_from: datetime | None = None, date_to: datetime | None = None,
+):
+    normalized_from = (
+        date_from.replace(tzinfo=UTC)
+        if date_from is not None and date_from.utcoffset() is None
+        else date_from.astimezone(UTC) if date_from is not None else None
+    )
+    normalized_to = (
+        date_to.replace(tzinfo=UTC)
+        if date_to is not None and date_to.utcoffset() is None
+        else date_to.astimezone(UTC) if date_to is not None else None
+    )
+    if normalized_from and normalized_to and normalized_from > normalized_to:
+        raise HTTPException(422, detail={
+            "code": "VALIDATION_ERROR",
+            "message": "date_from must not be later than date_to",
+            "field": "date_from",
+        })
+    result = await _store(request).list_product_price_history(
+        product_id, page=page, page_size=page_size,
+        date_from=normalized_from, date_to=normalized_to,
+    )
+    if result is None:
+        _not_found("Product not found")
+    items, total = result
+    return _page(items, page, page_size, total)
+
+
+@router.patch("/products/{product_id}")
+async def assign_product_category(
+    request: Request, product_id: UUID, payload: ProductCategoryAssignment,
+):
+    try:
+        row = await _store(request).assign_product_category(
+            product_id,
+            payload.category_id,
+            automatic=payload.category_mode == "automatic",
+        )
+    except LookupError as exc:
+        raise HTTPException(404, detail={
+            "code": "NOT_FOUND", "message": str(exc), "field": "category_id",
+        }) from None
+    except ValueError as exc:
+        raise HTTPException(409, detail={
+            "code": "CATEGORY_SITE_MISMATCH", "message": str(exc), "field": "category_id",
+        }) from None
+    if not row:
+        _not_found("Product not found")
+    return row
+
+
+@router.get("/product-categories")
+async def list_product_categories(
+    request: Request, page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200), site_id: UUID | None = None,
+    q: str | None = Query(None, max_length=200),
+):
+    items, total = await _store(request).list_product_categories(
+        page=page, page_size=page_size, site_id=site_id, q=q,
+    )
+    return _page(items, page, page_size, total)
+
+
+@router.post("/sites/{site_id}/product-categories", status_code=201)
+async def create_product_category(
+    request: Request, site_id: UUID, payload: ProductCategoryCreate,
+):
+    try:
+        row = await _store(request).create_product_category(
+            site_id, payload.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(409, detail={
+            "code": "CATEGORY_CONFLICT", "message": str(exc), "field": "name",
+        }) from None
+    if not row:
+        _not_found("Site not found")
+    return row
+
+
+@router.patch("/product-categories/{category_id}")
+async def update_product_category(
+    request: Request, category_id: UUID, payload: ProductCategoryUpdate,
+):
+    try:
+        row = await _store(request).update_product_category(
+            category_id, payload.model_dump(exclude_unset=True),
+        )
+    except ValueError as exc:
+        raise HTTPException(409, detail={
+            "code": "CATEGORY_CONFLICT", "message": str(exc), "field": "name",
+        }) from None
+    if not row:
+        _not_found("Product category not found")
+    return row
+
+
+@router.delete("/product-categories/{category_id}", status_code=204)
+async def delete_product_category(request: Request, category_id: UUID):
+    if not await _store(request).delete_product_category(category_id):
+        _not_found("Product category not found")
+    return Response(status_code=204)
 
 
 # -- Durable tasks ------------------------------------------------------
@@ -529,6 +673,76 @@ async def import_bookmarks(request: Request):
         await request.app.state.bookmark_staging.cleanup({"staging_path": staged["relative_path"]})
         raise
     return _task_json(task)
+
+
+# -- Local database backups --------------------------------------------
+@router.get("/backups")
+async def list_backups(request: Request):
+    try:
+        items = await asyncio.to_thread(_backups(request).list_backups)
+        pending = await asyncio.to_thread(_backups(request).pending_restore)
+    except BackupError as exc:
+        _raise_backup_error(exc)
+    return {
+        "items": [item.to_dict() for item in items],
+        "total": len(items),
+        "pending": pending.to_dict() if pending else None,
+    }
+
+
+@router.post("/backups", status_code=201)
+async def create_backup(request: Request, payload: BackupCreateRequest):
+    try:
+        record = await asyncio.to_thread(
+            _backups(request).create_backup,
+            label=payload.label,
+        )
+    except (BackupError, TypeError, ValueError) as exc:
+        if isinstance(exc, BackupError):
+            _raise_backup_error(exc)
+        raise HTTPException(422, detail={
+            "code": "INVALID_BACKUP_LABEL", "message": str(exc), "field": "label",
+        }) from None
+    return record.to_dict()
+
+
+@router.post("/backups/{backup_id}/verify")
+async def verify_backup(request: Request, backup_id: str):
+    try:
+        result = await asyncio.to_thread(_backups(request).verify_backup, backup_id)
+    except BackupError as exc:
+        _raise_backup_error(exc)
+    return result.to_dict()
+
+
+@router.post("/backups/{backup_id}/restore", status_code=202)
+async def stage_backup_restore(
+    request: Request, backup_id: str, payload: BackupRestoreRequest,
+):
+    if payload.confirmation != backup_id:
+        raise HTTPException(400, detail={
+            "code": "CONFIRMATION_REQUIRED",
+            "message": "Enter the full backup identifier to arrange a restore",
+            "field": "confirmation",
+        })
+    try:
+        pending = await asyncio.to_thread(_backups(request).stage_restore, backup_id)
+    except BackupError as exc:
+        _raise_backup_error(exc)
+    return {
+        "pending": pending.to_dict(),
+        "restart_required": True,
+        "message": "Restore verified and staged for the next SiteHub startup",
+    }
+
+
+@router.delete("/backups/restore-pending", status_code=204)
+async def cancel_backup_restore(request: Request):
+    try:
+        await asyncio.to_thread(_backups(request).cancel_pending_restore)
+    except BackupError as exc:
+        _raise_backup_error(exc)
+    return Response(status_code=204)
 
 
 # -- Folders, tags, history and inbox ----------------------------------

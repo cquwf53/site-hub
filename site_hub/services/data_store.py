@@ -1208,22 +1208,49 @@ class DataLayerStore:
                 raise StaleJobWrite("product result rejected because its job lease is no longer current")
             run = conn.execute("SELECT id FROM runs WHERE job_id=? ORDER BY attempt_no DESC LIMIT 1", (job_id,)).fetchone()
             run_id = run["id"] if run else None
-            category_ids = {row["name"]: row["id"] for row in conn.execute(
-                "SELECT id,name FROM product_categories WHERE site_id=?", (site_id,)
-            )}
+            category_rows = list(conn.execute(
+                "SELECT id,name,source_name FROM product_categories WHERE site_id=?",
+                (site_id,),
+            ))
+            # Source labels remain stable when a user renames the visible
+            # category. Case-folded lookup also prevents scraper-created
+            # categories that differ only by case.
+            category_ids = {
+                str(row["source_name"] or row["name"]).casefold(): row["id"]
+                for row in category_rows
+            }
+            display_category_ids = {
+                str(row["name"]).casefold(): row["id"] for row in category_rows
+            }
+            category_source_names = {
+                row["id"]: row["source_name"] for row in category_rows
+            }
             seen: set[str] = set()
             for index, raw in enumerate(products[:10_000]):
                 item = raw.as_dict() if hasattr(raw, "as_dict") else dict(raw)
                 name = str(item.get("name") or "").strip()[:500]
                 if not name: continue
                 category_name = str(item.get("category_name") or "全部").strip()[:200] or "全部"
-                category_id = category_ids.get(category_name)
+                category_key = category_name.casefold()
+                category_id = category_ids.get(category_key)
                 if not category_id:
-                    category_id = str(uuid4()); category_ids[category_name] = category_id
-                    conn.execute(
-                        """INSERT INTO product_categories(id,site_id,name,sort_order,created_at,updated_at)
-                           VALUES(?,?,?,?,?,?)""", (category_id, site_id, category_name, len(category_ids), now, now)
-                    )
+                    category_id = display_category_ids.get(category_key)
+                    if category_id and category_source_names.get(category_id) is None:
+                        conn.execute(
+                            "UPDATE product_categories SET source_name=?,updated_at=? WHERE id=?",
+                            (category_name, now, category_id),
+                        )
+                    elif not category_id:
+                        category_id = str(uuid4())
+                        conn.execute(
+                            """INSERT INTO product_categories(
+                                   id,site_id,name,sort_order,created_at,updated_at,source_name
+                               ) VALUES(?,?,?,?,?,?,?)""",
+                            (category_id, site_id, category_name, len(category_ids), now, now, category_name),
+                        )
+                        display_category_ids[category_key] = category_id
+                    category_ids[category_key] = category_id
+                    category_source_names[category_id] = category_name
                 external = str(item.get("external_key") or "").strip() or hashlib.sha256(
                     f"{category_name}\0{name}".encode("utf-8")
                 ).hexdigest()
@@ -1259,8 +1286,13 @@ class DataLayerStore:
                 stock = int(item.get("stock", -1) if item.get("stock") is not None else -1)
                 availability = "sold_out" if stock == 0 else "available"
                 product_id = old["id"] if old else str(uuid4())
+                effective_category_id = (
+                    old["category_id"]
+                    if old and bool(old["category_overridden"])
+                    else category_id
+                )
                 values = (
-                    category_id, name, item.get("price"), item.get("original_price"), stock,
+                    effective_category_id, category_id, name, item.get("price"), item.get("original_price"), stock,
                     item.get("stock_text"), int(item.get("sold") or 0), str(item.get("description") or "")[:4000] or None,
                     endpoint_id, url_base, suffix_id, _dumps(item.get("tags") or []), availability, now, now,
                 )
@@ -1268,7 +1300,7 @@ class DataLayerStore:
                     if old["buy_url_suffix_secret_id"] and old["buy_url_suffix_secret_id"] != suffix_id:
                         obsolete_secret_ids.add(old["buy_url_suffix_secret_id"])
                     conn.execute(
-                        """UPDATE products SET category_id=?,name=?,price=?,original_price=?,stock=?,stock_text=?,sold=?,
+                        """UPDATE products SET category_id=?,scraped_category_id=?,name=?,price=?,original_price=?,stock=?,stock_text=?,sold=?,
                                   description=?,buy_endpoint_id=?,buy_url_base=?,buy_url_suffix_secret_id=?,raw_tags_json=?,availability_status=?,
                                   availability_reason=NULL,last_observed_at=?,updated_at=? WHERE id=?""",
                         (*values, product_id),
@@ -1299,10 +1331,10 @@ class DataLayerStore:
                         )
                 else:
                     conn.execute(
-                        """INSERT INTO products(id,site_id,category_id,external_key,name,price,original_price,stock,stock_text,
+                        """INSERT INTO products(id,site_id,category_id,scraped_category_id,external_key,name,price,original_price,stock,stock_text,
                                   sold,description,buy_endpoint_id,buy_url_base,buy_url_suffix_secret_id,raw_tags_json,availability_status,
-                                  last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (product_id, site_id, values[0], external, *values[1:-1], now, values[-1]),
+                                  last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (product_id, site_id, values[0], values[1], external, *values[2:-1], now, values[-1]),
                     )
                     created += 1
                 conn.execute(
@@ -1414,7 +1446,8 @@ class DataLayerStore:
                 """SELECT c.site_id,s.policy_json FROM schedules s
                    JOIN capability_instances c ON c.id=s.capability_instance_id
                    WHERE c.code='product_monitor' AND c.enabled=1 AND s.enabled=1
-                     AND (s.next_run_at IS NULL OR s.next_run_at<=?) ORDER BY c.site_id""",
+                     AND lower(trim(coalesce(c.adapter,''))) NOT IN ('','none','manual')
+                      AND (s.next_run_at IS NULL OR s.next_run_at<=?) ORDER BY c.site_id""",
                 (now,),
             ).fetchall()
             result = []
@@ -1964,12 +1997,30 @@ class DataLayerStore:
         base = """ FROM schedules s
                   JOIN capability_instances c ON c.id=s.capability_instance_id
                   JOIN sites st ON st.id=c.site_id
-                  LEFT JOIN site_accounts a ON a.id=c.account_id"""
+                  LEFT JOIN site_accounts a ON a.id=c.account_id
+                  LEFT JOIN jobs active_job ON active_job.id=(
+                      SELECT candidate.id FROM jobs candidate
+                      WHERE candidate.capability_instance_id=c.id
+                        AND candidate.status IN ('queued','leased','running')
+                      ORDER BY candidate.created_at DESC,candidate.id DESC LIMIT 1
+                  )
+                  LEFT JOIN jobs terminal_job ON terminal_job.id=(
+                      SELECT candidate.id FROM jobs candidate
+                      WHERE candidate.capability_instance_id=c.id
+                        AND candidate.status IN ('succeeded','failed','skipped','cancelled','effect_unknown')
+                      ORDER BY candidate.created_at DESC,candidate.id DESC LIMIT 1
+                  )"""
         with self.database.connect() as conn:
             total = int(conn.execute("SELECT COUNT(*)" + base + where, params).fetchone()[0])
             rows = conn.execute(
-                """SELECT s.*,c.code capability,c.site_id,c.account_id,
-                          st.name site_name,a.label account_label""" + base + where +
+                """SELECT s.*,c.code capability,c.site_id,c.account_id,c.adapter scraper_type,
+                          st.name site_name,a.label account_label,
+                          active_job.id current_job_id,active_job.status current_status,
+                          active_job.created_at current_job_at,
+                          terminal_job.id last_job_id,terminal_job.status last_status,
+                          terminal_job.finished_at last_run_at,
+                          json_extract(terminal_job.result_json,'$._error_kind') last_error_kind,
+                          terminal_job.last_error last_error_message""" + base + where +
                 " ORDER BY s.enabled DESC,s.next_run_at IS NULL,s.next_run_at,st.name,a.label LIMIT ? OFFSET ?",
                 [*params, page_size, (page - 1) * page_size],
             ).fetchall()
@@ -1979,6 +2030,17 @@ class DataLayerStore:
             row["enabled"] = bool(row.get("enabled"))
             row["policy"] = _loads(row.pop("policy_json", None), {})
             row["backoff"] = _loads(row.pop("backoff_json", None), {})
+            if row.get("capability") == self.PRODUCT_CODE:
+                scraper_type = str(row.get("scraper_type") or "none").strip().casefold()
+                row["automatic_run_supported"] = scraper_type not in {"", "none", "manual"}
+                row["automatic_run_reason"] = (
+                    "manual_catalog" if scraper_type == "manual"
+                    else "scraper_not_configured" if scraper_type in {"", "none"}
+                    else None
+                )
+            else:
+                row["automatic_run_supported"] = True
+                row["automatic_run_reason"] = None
             result.append(row)
         return result, total
 
@@ -2155,14 +2217,16 @@ class DataLayerStore:
             return conn.execute("DELETE FROM tags WHERE id=?", (tag_id,)).rowcount == 1
 
     async def list_products(self, *, page: int, page_size: int, site_id: UUID | None = None,
-                            q: str | None = None, availability_status: str | None = None):
+                            q: str | None = None, availability_status: str | None = None,
+                            category_id: UUID | None = None):
         return await self._call(
             self._list_products_sync, page, page_size, _uuid(site_id) if site_id else None,
-            q, availability_status,
+            q, availability_status, _uuid(category_id) if category_id else None,
         )
 
     def _list_products_sync(self, page: int, page_size: int, site_id: str | None,
-                            q: str | None, availability: str | None):
+                            q: str | None, availability: str | None,
+                            category_id: str | None):
         clauses, params = [], []
         if site_id:
             clauses.append("p.site_id=?"); params.append(site_id)
@@ -2171,28 +2235,262 @@ class DataLayerStore:
             params.extend([f"%{q}%", f"%{q}%"])
         if availability:
             clauses.append("p.availability_status=?"); params.append(availability)
+        if category_id:
+            clauses.append("p.category_id=?"); params.append(category_id)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.database.connect() as conn:
             total = int(conn.execute("SELECT COUNT(*) FROM products p" + where, params).fetchone()[0])
             rows = conn.execute(
-                """SELECT p.*,s.name site_name,
-                          COALESCE(e.url_base,p.buy_url_base) AS url
-                   FROM products p JOIN sites s ON s.id=p.site_id
-                   LEFT JOIN site_endpoints e ON e.id=p.buy_endpoint_id""" + where +
+                """SELECT p.*,s.name site_name,pc.name category_name,
+                           scraped_pc.name scraped_category_name,
+                           COALESCE(e.url_base,p.buy_url_base) AS url
+                    FROM products p JOIN sites s ON s.id=p.site_id
+                    LEFT JOIN product_categories pc ON pc.id=p.category_id
+                    LEFT JOIN product_categories scraped_pc ON scraped_pc.id=p.scraped_category_id
+                    LEFT JOIN site_endpoints e ON e.id=p.buy_endpoint_id""" + where +
                 " ORDER BY p.updated_at DESC,p.id LIMIT ? OFFSET ?",
                 [*params, page_size, (page - 1) * page_size],
             ).fetchall()
             return [self._normalize_product(dict(row)) for row in rows], total
 
+    async def get_product(self, product_id: UUID) -> dict[str, Any] | None:
+        return await self._call(self._get_product_sync, _uuid(product_id))
+
+    def _get_product_sync(self, product_id: str) -> dict[str, Any] | None:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """SELECT p.*,s.name site_name,pc.name category_name,
+                          scraped_pc.name scraped_category_name,
+                          COALESCE(e.url_base,p.buy_url_base) AS url
+                   FROM products p JOIN sites s ON s.id=p.site_id
+                   LEFT JOIN product_categories pc ON pc.id=p.category_id
+                   LEFT JOIN product_categories scraped_pc ON scraped_pc.id=p.scraped_category_id
+                   LEFT JOIN site_endpoints e ON e.id=p.buy_endpoint_id
+                   WHERE p.id=?""",
+                (product_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            result = self._normalize_product(dict(row))
+            result["tags"] = [dict(item) for item in conn.execute(
+                """SELECT t.id,t.name,t.color,t.icon FROM tags t
+                   JOIN product_tags pt ON pt.tag_id=t.id
+                   WHERE pt.product_id=? ORDER BY t.sort_order,t.name,t.id""",
+                (product_id,),
+            )]
+            stats = conn.execute(
+                """SELECT COUNT(*) observation_count,MIN(price) min_price,MAX(price) max_price,
+                          MIN(observed_at) first_observed_at,MAX(observed_at) last_observed_at
+                   FROM price_observations WHERE product_id=?""",
+                (product_id,),
+            ).fetchone()
+            result["price_history_summary"] = dict(stats) if stats else {
+                "observation_count": 0, "min_price": None, "max_price": None,
+                "first_observed_at": None, "last_observed_at": None,
+            }
+            return result
+
+    async def list_product_price_history(
+        self, product_id: UUID, *, page: int, page_size: int,
+        date_from: datetime | None = None, date_to: datetime | None = None,
+    ) -> tuple[list[dict[str, Any]], int] | None:
+        return await self._call(
+            self._list_product_price_history_sync, _uuid(product_id), page, page_size,
+            _iso(date_from), _iso(date_to),
+        )
+
+    def _list_product_price_history_sync(
+        self, product_id: str, page: int, page_size: int,
+        date_from: str | None, date_to: str | None,
+    ) -> tuple[list[dict[str, Any]], int] | None:
+        clauses = ["product_id=?"]
+        params: list[Any] = [product_id]
+        if date_from:
+            clauses.append("observed_at>=?"); params.append(date_from)
+        if date_to:
+            clauses.append("observed_at<=?"); params.append(date_to)
+        where = " WHERE " + " AND ".join(clauses)
+        with self.database.connect() as conn:
+            if conn.execute("SELECT 1 FROM products WHERE id=?", (product_id,)).fetchone() is None:
+                return None
+            total = int(conn.execute(
+                "SELECT COUNT(*) FROM price_observations" + where, params,
+            ).fetchone()[0])
+            rows = conn.execute(
+                """SELECT id,product_id,price,stock,availability_status,observed_at,source_run_id
+                   FROM price_observations""" + where +
+                " ORDER BY observed_at DESC,id DESC LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+            return [dict(row) for row in rows], total
+
+    async def list_product_categories(
+        self, *, page: int, page_size: int, site_id: UUID | None = None,
+        q: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        return await self._call(
+            self._list_product_categories_sync, page, page_size,
+            _uuid(site_id) if site_id else None, q,
+        )
+
+    def _list_product_categories_sync(
+        self, page: int, page_size: int, site_id: str | None, q: str | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if site_id:
+            clauses.append("pc.site_id=?"); params.append(site_id)
+        if q:
+            clauses.append("(pc.name LIKE ? OR s.name LIKE ?)")
+            params.extend([f"%{q}%", f"%{q}%"])
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.database.connect() as conn:
+            total = int(conn.execute(
+                """SELECT COUNT(*) FROM product_categories pc
+                   JOIN sites s ON s.id=pc.site_id""" + where,
+                params,
+            ).fetchone()[0])
+            rows = conn.execute(
+                """SELECT pc.*,s.name site_name,COUNT(p.id) product_count
+                   FROM product_categories pc JOIN sites s ON s.id=pc.site_id
+                   LEFT JOIN products p ON p.category_id=pc.id""" + where +
+                " GROUP BY pc.id ORDER BY s.name COLLATE NOCASE,pc.sort_order,pc.name COLLATE NOCASE,pc.id LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+            return [dict(row) for row in rows], total
+
+    async def create_product_category(
+        self, site_id: UUID, payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        return await self._call(
+            self._create_product_category_sync, _uuid(site_id), payload,
+        )
+
+    def _create_product_category_sync(
+        self, site_id: str, payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        name = str(payload["name"]).strip()
+        now = _iso(datetime.now(UTC)); category_id = str(uuid4())
+        with self.database.transaction(immediate=True) as conn:
+            site = conn.execute(
+                "SELECT name FROM sites WHERE id=? AND status!='archived'", (site_id,),
+            ).fetchone()
+            if site is None:
+                return None
+            duplicate = conn.execute(
+                "SELECT 1 FROM product_categories WHERE site_id=? AND name=? COLLATE NOCASE",
+                (site_id, name),
+            ).fetchone()
+            if duplicate:
+                raise ValueError("A category with this name already exists for the site")
+            conn.execute(
+                """INSERT INTO product_categories(id,site_id,name,sort_order,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (category_id, site_id, name, int(payload.get("sort_order", 0)), now, now),
+            )
+            return {
+                "id": category_id, "site_id": site_id, "site_name": site["name"],
+                "name": name, "sort_order": int(payload.get("sort_order", 0)),
+                "product_count": 0, "created_at": now, "updated_at": now,
+            }
+
+    async def update_product_category(
+        self, category_id: UUID, payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        return await self._call(
+            self._update_product_category_sync, _uuid(category_id), payload,
+        )
+
+    def _update_product_category_sync(
+        self, category_id: str, payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        with self.database.transaction(immediate=True) as conn:
+            current = conn.execute(
+                "SELECT * FROM product_categories WHERE id=?", (category_id,),
+            ).fetchone()
+            if current is None:
+                return None
+            name = str(payload.get("name", current["name"])).strip()
+            if conn.execute(
+                """SELECT 1 FROM product_categories
+                   WHERE site_id=? AND id!=? AND name=? COLLATE NOCASE""",
+                (current["site_id"], category_id, name),
+            ).fetchone():
+                raise ValueError("A category with this name already exists for the site")
+            now = _iso(datetime.now(UTC))
+            conn.execute(
+                "UPDATE product_categories SET name=?,sort_order=?,updated_at=? WHERE id=?",
+                (name, int(payload.get("sort_order", current["sort_order"])), now, category_id),
+            )
+            row = conn.execute(
+                """SELECT pc.*,s.name site_name,
+                          (SELECT COUNT(*) FROM products p WHERE p.category_id=pc.id) product_count
+                   FROM product_categories pc JOIN sites s ON s.id=pc.site_id WHERE pc.id=?""",
+                (category_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def delete_product_category(self, category_id: UUID) -> bool:
+        return await self._call(self._delete_product_category_sync, _uuid(category_id))
+
+    def _delete_product_category_sync(self, category_id: str) -> bool:
+        with self.database.transaction(immediate=True) as conn:
+            return conn.execute(
+                "DELETE FROM product_categories WHERE id=?", (category_id,),
+            ).rowcount == 1
+
+    async def assign_product_category(
+        self, product_id: UUID, category_id: UUID | None, *, automatic: bool = False,
+    ) -> dict[str, Any] | None:
+        return await self._call(
+            self._assign_product_category_sync, _uuid(product_id),
+            _uuid(category_id) if category_id else None, automatic,
+        )
+
+    def _assign_product_category_sync(
+        self, product_id: str, category_id: str | None, automatic: bool,
+    ) -> dict[str, Any] | None:
+        with self.database.transaction(immediate=True) as conn:
+            product = conn.execute(
+                "SELECT site_id,scraped_category_id FROM products WHERE id=?", (product_id,),
+            ).fetchone()
+            if product is None:
+                return None
+            if category_id and not automatic:
+                category = conn.execute(
+                    "SELECT site_id FROM product_categories WHERE id=?", (category_id,),
+                ).fetchone()
+                if category is None:
+                    raise LookupError("Product category not found")
+                if category["site_id"] != product["site_id"]:
+                    raise ValueError("A product can only use a category from the same site")
+            effective_category_id = product["scraped_category_id"] if automatic else category_id
+            conn.execute(
+                """UPDATE products
+                   SET category_id=?,category_overridden=?,updated_at=? WHERE id=?""",
+                (
+                    effective_category_id,
+                    0 if automatic else 1,
+                    _iso(datetime.now(UTC)),
+                    product_id,
+                ),
+            )
+        return self._get_product_sync(product_id)
+
     @staticmethod
     def _normalize_product(row: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": row["id"], "site_id": row["site_id"], "site_name": row.get("site_name"),
+            "category_id": row.get("category_id"), "category_name": row.get("category_name"),
+            "scraped_category_id": row.get("scraped_category_id"),
+            "scraped_category_name": row.get("scraped_category_name"),
+            "category_overridden": bool(row.get("category_overridden", 0)),
             "external_key": row.get("external_key"), "name": row["name"], "url": row.get("url"),
             "price": row.get("price"), "original_price": row.get("original_price"),
             "stock": row.get("stock"), "availability_status": row.get("availability_status"),
             "buy_endpoint_id": row.get("buy_endpoint_id"),
             "availability_reason": row.get("availability_reason"), "description": row.get("description"),
+            "raw_tags": _loads(row.get("raw_tags_json"), []),
             "updated_at": row.get("updated_at"), "last_observed_at": row.get("last_observed_at"),
         }
 

@@ -102,6 +102,11 @@ export interface Product {
   id: ID
   site_id: ID
   site_name?: string
+  category_id?: ID | null
+  category_name?: string | null
+  scraped_category_id?: ID | null
+  scraped_category_name?: string | null
+  category_overridden?: boolean
   external_key?: string | null
   name: string
   image_url?: string | null
@@ -113,7 +118,42 @@ export interface Product {
   stock?: number | null
   availability_status?: string
   availability_reason?: string | null
+  description?: string | null
+  raw_tags?: string[]
+  tags?: Tag[]
+  last_observed_at?: string | null
   updated_at?: string
+  price_history_summary?: PriceHistorySummary
+}
+
+export interface ProductCategory {
+  id: ID
+  site_id: ID
+  site_name: string
+  name: string
+  source_name?: string | null
+  sort_order: number
+  product_count: number
+  created_at?: string
+  updated_at?: string
+}
+
+export interface PriceObservation {
+  id: ID
+  product_id: ID
+  price: number | null
+  stock: number | null
+  availability_status: string
+  observed_at: string
+  source_run_id?: ID | null
+}
+
+export interface PriceHistorySummary {
+  observation_count: number
+  min_price: number | null
+  max_price: number | null
+  first_observed_at: string | null
+  last_observed_at: string | null
 }
 
 export interface InboxEvent {
