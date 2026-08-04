@@ -73,7 +73,9 @@ class ScheduleCoordinator:
         if planned.tzinfo is None: planned = planned.replace(tzinfo=UTC)
         now_utc = local.astimezone(UTC)
         if (
-            batch.get("trigger_reason", "normal") == "normal"
+            batch.get("status") == "pending"
+            and not batch.get("started_at")
+            and batch.get("trigger_reason", "normal") == "normal"
             and now_utc > planned.astimezone(UTC) + timedelta(minutes=5)
         ):
             latest = datetime.combine(local.date(), time(23, 0), self.timezone)
