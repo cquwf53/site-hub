@@ -18,11 +18,13 @@ from site_hub.models import (
     BackupCreateRequest, BackupRestoreRequest,
     CheckinAccountCreate, CheckinAccountUpdate, JobKind, JobStatus,
     ProductCategoryAssignment, ProductCategoryCreate, ProductCategoryUpdate,
-    ProductSettingsUpdate, ScheduleSettingsUpdate, SiteCreate, SiteUpdate,
+    ProductSettingsUpdate, ScheduleSettingsUpdate, SiteCreate, SiteTypeBulkAssignment,
+    SiteTypeCreate, SiteTypeUpdate, SiteUpdate,
 )
 from site_hub.services.backups import (
     BackupError, BackupNotFoundError, BackupPathError, BackupValidationError,
 )
+from site_hub.services.ports import SiteTypeConflict
 
 
 router = APIRouter(prefix="/api/v1")
@@ -70,6 +72,19 @@ def _notification_channels(request: Request):
 
 def _not_found(message: str = "Resource not found") -> None:
     raise HTTPException(404, detail={"code": "NOT_FOUND", "message": message})
+
+
+def _raise_site_type_conflict(exc: SiteTypeConflict) -> None:
+    if exc.code in {"SITE_TYPE_NOT_FOUND", "SITE_TYPE_REQUIRED", "SITE_TYPE_MISMATCH"}:
+        status = 422
+    elif exc.code == "SITE_NOT_FOUND":
+        status = 404
+    else:
+        status = 409
+    raise HTTPException(
+        status,
+        detail={"code": exc.code, "message": str(exc), "field": "site_type_id"},
+    ) from None
 
 
 def _page(items: list[dict[str, Any]], page: int, page_size: int, total: int) -> dict[str, Any]:
@@ -125,7 +140,7 @@ async def bootstrap(request: Request):
         "csrf_token": request.app.state.settings.csrf_token,
         "api_version": "v1",
         "features": {
-            "sites": True, "checkin": True, "products": True,
+            "sites": True, "site_types": True, "checkin": True, "products": True,
             "encrypted_secrets": getattr(_store(request), "secret_service", None) is not None,
             "node_worker": worker["state"] != "disabled",
             "notifications": request.app.state.notification_channels is not None,
@@ -134,19 +149,81 @@ async def bootstrap(request: Request):
     }
 
 
-# -- Sites and accounts -------------------------------------------------
+# -- Controlled site types, sites and accounts --------------------------
+@router.get("/site-types")
+async def list_site_types(request: Request, enabled: bool | None = None):
+    return await _store(request).list_site_types(enabled=enabled)
+
+
+@router.post("/site-types", status_code=201)
+async def create_site_type(request: Request, payload: SiteTypeCreate):
+    try:
+        return await _store(request).create_site_type(payload.model_dump())
+    except SiteTypeConflict as exc:
+        _raise_site_type_conflict(exc)
+
+
+@router.get("/site-types/{site_type_id}")
+async def get_site_type(request: Request, site_type_id: UUID):
+    row = await _store(request).get_site_type(site_type_id)
+    if not row:
+        _not_found("Site type not found")
+    return row
+
+
+@router.patch("/site-types/{site_type_id}")
+async def update_site_type(
+    request: Request, site_type_id: UUID, payload: SiteTypeUpdate,
+):
+    try:
+        row = await _store(request).update_site_type(
+            site_type_id, payload.model_dump(exclude_unset=True),
+        )
+    except SiteTypeConflict as exc:
+        _raise_site_type_conflict(exc)
+    if not row:
+        _not_found("Site type not found")
+    return row
+
+
+@router.delete("/site-types/{site_type_id}", status_code=204)
+async def delete_site_type(request: Request, site_type_id: UUID):
+    try:
+        deleted = await _store(request).delete_site_type(site_type_id)
+    except SiteTypeConflict as exc:
+        _raise_site_type_conflict(exc)
+    if not deleted:
+        _not_found("Site type not found")
+    return Response(status_code=204)
+
+
 @router.get("/sites")
 async def list_sites(request: Request, page: int = Query(1, ge=1),
                      page_size: int = Query(20, ge=1, le=200), q: str | None = None,
-                     folder_id: str | None = None, tag_id: UUID | None = None):
+                     folder_id: str | None = None, tag_id: UUID | None = None,
+                     site_type_id: UUID | None = None):
     items, total = await _store(request).list_sites(page=page, page_size=page_size, q=q,
-                                                    folder_id=folder_id, tag_id=tag_id)
+                                                    folder_id=folder_id, tag_id=tag_id,
+                                                    site_type_id=site_type_id)
     return _page(items, page, page_size, total)
 
 
 @router.post("/sites", status_code=201)
 async def create_site(request: Request, payload: SiteCreate):
-    return await _store(request).create_site(payload.model_dump(exclude_unset=True))
+    try:
+        return await _store(request).create_site(payload.model_dump(exclude_unset=True))
+    except SiteTypeConflict as exc:
+        _raise_site_type_conflict(exc)
+
+
+@router.post("/sites/bulk/site-type")
+async def bulk_set_site_type(request: Request, payload: SiteTypeBulkAssignment):
+    try:
+        return await _store(request).bulk_set_site_type(
+            payload.site_ids, payload.site_type_id,
+        )
+    except SiteTypeConflict as exc:
+        _raise_site_type_conflict(exc)
 
 
 @router.get("/sites/{site_id}")
@@ -162,7 +239,10 @@ async def update_site(request: Request, site_id: UUID, payload: SiteUpdate):
         await _require_adapter_capability(
             request, payload.adapter, "product_monitor", allow_none=True,
         )
-    row = await _store(request).update_site(site_id, payload.model_dump(exclude_unset=True))
+    try:
+        row = await _store(request).update_site(site_id, payload.model_dump(exclude_unset=True))
+    except SiteTypeConflict as exc:
+        _raise_site_type_conflict(exc)
     if not row: _not_found("Site not found")
     return row
 

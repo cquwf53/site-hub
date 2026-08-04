@@ -65,6 +65,7 @@ class SiteBase(BaseModel):
     url: str = Field(min_length=1, max_length=2048, validation_alias=AliasChoices("url", "origin"))
     folder_id: UUID | None = None
     kind: str = Field(default="other", max_length=64)
+    site_type_id: UUID | None = None
     capabilities: list[str] = Field(default_factory=lambda: ["bookmark"])
     description: str = Field(default="", max_length=4000)
     note: str = Field(default="", max_length=10000)
@@ -93,6 +94,7 @@ class SiteUpdate(BaseModel):
     url: str | None = Field(default=None, min_length=1, max_length=2048, validation_alias=AliasChoices("url", "origin"))
     folder_id: UUID | None = None
     kind: str | None = Field(default=None, max_length=64)
+    site_type_id: UUID | None = None
     capabilities: list[str] | None = None
     description: str | None = Field(default=None, max_length=4000)
     note: str | None = Field(default=None, max_length=10000)
@@ -119,6 +121,7 @@ class SiteOut(SiteBase):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     favicon_path: str | None = None
+    site_type: dict[str, Any] | None = None
     tags: list[dict[str, Any]] = Field(default_factory=list)
     checkin_account_count: int = 0
     product_count: int = 0
@@ -128,6 +131,95 @@ class SiteOut(SiteBase):
     configured_secret_fields: list[str] = Field(default_factory=list)
     created_at: str | None = None
     updated_at: str | None = None
+
+
+class SiteTypeBase(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    slug: str = Field(
+        min_length=1, max_length=64,
+        pattern=r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
+    )
+    color: str = Field(default="#64748b", pattern=r"^#[0-9A-Fa-f]{6}$")
+    icon: str = Field(default="globe", min_length=1, max_length=64)
+    sort_order: int = Field(default=0, ge=0, le=1_000_000)
+    enabled: bool = True
+
+    @field_validator("name", "slug", "icon")
+    @classmethod
+    def normalize_site_type_text(cls, value: str, info) -> str:
+        value = value.strip()
+        if info.field_name == "slug":
+            value = value.lower()
+        if not value:
+            raise ValueError(f"{info.field_name} must not be blank")
+        return value
+
+    @field_validator("color")
+    @classmethod
+    def normalize_site_type_color(cls, value: str) -> str:
+        return value.lower()
+
+
+class SiteTypeCreate(SiteTypeBase):
+    pass
+
+
+class SiteTypeUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    slug: str | None = Field(
+        default=None, min_length=1, max_length=64,
+        pattern=r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
+    )
+    color: str | None = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
+    icon: str | None = Field(default=None, min_length=1, max_length=64)
+    sort_order: int | None = Field(default=None, ge=0, le=1_000_000)
+    enabled: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_nulls(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            nullable = {"name", "slug", "color", "icon", "sort_order", "enabled"}
+            nulls = nullable.intersection(key for key, item in value.items() if item is None)
+            if nulls:
+                raise ValueError(f"{sorted(nulls)[0]} must not be null")
+        return value
+
+    @field_validator("name", "slug", "icon")
+    @classmethod
+    def normalize_site_type_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return value
+        value = value.strip()
+        if info.field_name == "slug":
+            value = value.lower()
+        if not value:
+            raise ValueError(f"{info.field_name} must not be blank")
+        return value
+
+    @field_validator("color")
+    @classmethod
+    def normalize_site_type_color(cls, value: str | None) -> str | None:
+        return value.lower() if value is not None else None
+
+
+class SiteTypeOut(SiteTypeBase):
+    id: UUID
+    is_system: bool = False
+    is_default: bool = False
+    site_count: int = 0
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class SiteTypeBulkAssignment(BaseModel):
+    site_ids: list[UUID] = Field(min_length=1, max_length=500)
+    site_type_id: UUID
+
+    @field_validator("site_ids")
+    @classmethod
+    def unique_site_ids(cls, value: list[UUID]) -> list[UUID]:
+        return list(dict.fromkeys(value))
 
 
 class CheckinScheduleOverride(BaseModel):

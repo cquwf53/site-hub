@@ -66,7 +66,7 @@ Webhook 地址存放在 `secrets` 表的 DPAPI CurrentUser 密文中。通道列
 - `staging/`：书签导入等系统任务的受控暂存；
 - `logs/`：服务日志。
 
-网站目录和商品分类是两个独立领域。同一域名可存在多个业务网站，同一网站可有多个签到账号。URL 的查询参数/fragment、Cookie、Token、Authorization 和 Webhook 地址不进入普通配置或公共响应。
+网站使用一个受控主类型、一个树状目录和多个标签共同整理；`site_types` 与兼容字段 `sites.kind` 由数据库约束保持同步。网站目录、网站类型和商品分类是彼此独立的领域。同一域名可存在多个业务网站，同一网站可有多个签到账号。URL 的查询参数/fragment、Cookie、Token、Authorization 和 Webhook 地址不进入普通配置或公共响应。
 
 ## 调度与故障语义
 

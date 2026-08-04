@@ -389,9 +389,85 @@ V2_STATEMENTS = (
 )
 
 
+V3_STATEMENTS = (
+    """CREATE TABLE site_types (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(name)) BETWEEN 1 AND 100),
+        slug TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(slug)) BETWEEN 1 AND 64),
+        color TEXT NOT NULL DEFAULT '#64748b' CHECK(
+            color GLOB '#[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'
+        ),
+        icon TEXT NOT NULL DEFAULT 'globe' CHECK(length(icon) BETWEEN 1 AND 64),
+        sort_order INTEGER NOT NULL DEFAULT 0 CHECK(sort_order BETWEEN 0 AND 1000000),
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+        is_system INTEGER NOT NULL DEFAULT 0 CHECK(is_system IN (0,1)),
+        is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    "CREATE UNIQUE INDEX uq_site_types_default ON site_types(is_default) WHERE is_default=1",
+    "CREATE INDEX idx_site_types_list ON site_types(enabled DESC,sort_order,name,id)",
+    """INSERT INTO site_types(
+           id,name,slug,color,icon,sort_order,enabled,is_system,is_default,created_at,updated_at
+       ) VALUES
+       (sitehub_uuid('site-type:other'),'其他','other','#64748b','globe',900,1,1,1,
+        strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+       (sitehub_uuid('site-type:shop'),'商城','shop','#4f46e5','shopping-bag',10,1,1,0,
+        strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+       (sitehub_uuid('site-type:checkin'),'签到','checkin','#059669','calendar-check',20,1,1,0,
+        strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+       (sitehub_uuid('site-type:tool'),'工具','tool','#d97706','wrench',30,1,1,0,
+        strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+       (sitehub_uuid('site-type:bookmark'),'书签','bookmark','#0284c7','bookmark',40,1,1,0,
+        strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))""",
+    # Preserve every legacy ``sites.kind`` value. Known slugs use the curated
+    # records above; unknown values receive a deterministic UUID so rehearsal
+    # and cutover databases produce the same mapping.
+    """INSERT OR IGNORE INTO site_types(
+           id,name,slug,color,icon,sort_order,enabled,is_system,is_default,created_at,updated_at
+       )
+       SELECT sitehub_uuid('site-type:' || lower(trim(kind))),trim(kind),lower(trim(kind)),
+              '#64748b','globe',800,1,0,0,
+              strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       FROM sites WHERE length(trim(kind)) BETWEEN 1 AND 64
+       GROUP BY lower(trim(kind))""",
+    "ALTER TABLE sites ADD COLUMN site_type_id TEXT REFERENCES site_types(id) ON DELETE RESTRICT",
+    """UPDATE sites
+       SET site_type_id=COALESCE(
+             (SELECT id FROM site_types WHERE slug=lower(trim(sites.kind))),
+             sitehub_uuid('site-type:other')
+           )""",
+    """UPDATE sites
+       SET kind=(SELECT slug FROM site_types WHERE id=sites.site_type_id)""",
+    "CREATE INDEX idx_sites_type_order ON sites(site_type_id,pinned DESC,sort_order,id)",
+    # SQLite cannot add a NOT NULL reference with a dynamic backfill default.
+    # These guards make the post-migration invariant equivalent and also keep
+    # the legacy ``kind`` compatibility column synchronized by contract.
+    """CREATE TRIGGER trg_sites_type_insert
+       BEFORE INSERT ON sites
+       WHEN NEW.site_type_id IS NULL OR NOT EXISTS(
+            SELECT 1 FROM site_types t
+            WHERE t.id=NEW.site_type_id AND t.slug=NEW.kind COLLATE NOCASE
+       )
+       BEGIN
+         SELECT RAISE(ABORT,'site_type_id and kind must reference the same site type');
+       END""",
+    """CREATE TRIGGER trg_sites_type_update
+       BEFORE UPDATE OF site_type_id,kind ON sites
+       WHEN NEW.site_type_id IS NULL OR NOT EXISTS(
+            SELECT 1 FROM site_types t
+            WHERE t.id=NEW.site_type_id AND t.slug=NEW.kind COLLATE NOCASE
+       )
+       BEGIN
+         SELECT RAISE(ABORT,'site_type_id and kind must reference the same site type');
+       END""",
+)
+
+
 MIGRATIONS = (
     Migration(1, "initial-unified-schema", V1_STATEMENTS),
     Migration(2, "preserve-manual-product-categories", V2_STATEMENTS),
+    Migration(3, "controlled-site-types", V3_STATEMENTS),
 )
 SCHEMA_VERSION = MIGRATIONS[-1].version
 

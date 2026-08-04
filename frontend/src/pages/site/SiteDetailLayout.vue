@@ -6,6 +6,7 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import { api, apiErrorMessage } from '@/api/client'
 import type { Site } from '@/api/types'
 import { safeExternalUrl, hostname } from '@/utils/format'
+import { siteTypeIcon } from '@/utils/siteType'
 import { useAppStore } from '@/stores/app'
 import { siteDetailKey } from './siteContext'
 
@@ -39,7 +40,7 @@ watch(() => route.params.siteId, load, { immediate: true })
   <AsyncState :loading="loading" :error="error" @retry="load">
     <template v-if="site">
       <header class="site-detail-header">
-        <div class="site-identity"><span class="site-icon large">{{ site.name.slice(0, 1).toUpperCase() }}</span><div><div class="row"><h1>{{ site.name }}</h1><StatusBadge :status="site.status" /></div><p>{{ hostname(site.url) }}</p></div></div>
+        <div class="site-identity"><span class="site-icon large">{{ site.name.slice(0, 1).toUpperCase() }}</span><div><div class="row"><h1>{{ site.name }}</h1><StatusBadge :status="site.status" /><span v-if="site.site_type" class="site-type" :style="{ color: site.site_type.color || '#6e7078', borderColor: `${site.site_type.color || '#6e7078'}55`, background: `${site.site_type.color || '#6e7078'}12` }"><span v-if="site.site_type.icon">{{ siteTypeIcon(site.site_type.icon) }}</span>{{ site.site_type.name }}</span></div><p>{{ hostname(site.url) }}</p></div></div>
         <div class="page-actions"><button v-if="site.default_endpoint_id || safeExternalUrl(site.url)" class="button secondary" @click="openSite">访问网站 ↗</button></div>
       </header>
       <nav class="tabs site-tabs" aria-label="网站详情">
@@ -51,6 +52,6 @@ watch(() => route.params.siteId, load, { immediate: true })
 </template>
 
 <style scoped>
-.site-detail-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 22px; }.site-identity { display: flex; align-items: center; gap: 14px; }.site-icon.large { width: 48px; height: 48px; border-radius: 11px; font-size: 19px; }.site-identity h1 { margin: 0; }.site-identity p { margin: 4px 0 0; font-size: 13px; }.site-tabs { margin-bottom: 22px; }.site-detail-content { min-height: 300px; }
+.site-detail-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 22px; }.site-identity { display: flex; min-width: 0; align-items: center; gap: 14px; }.site-identity .row { flex-wrap: wrap; }.site-icon.large { width: 48px; height: 48px; border-radius: 11px; font-size: 19px; }.site-identity h1 { margin: 0; }.site-identity p { margin: 4px 0 0; font-size: 13px; }.site-type { display: inline-flex; min-height: 24px; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid; border-radius: 7px; font-size: 11px; font-weight: 600; white-space: nowrap; }.site-tabs { margin-bottom: 22px; }.site-detail-content { min-height: 300px; }
 @media (max-width: 600px) { .site-detail-header { align-items: flex-start; }.site-detail-header .button { flex: 0; font-size: 0; }.site-detail-header .button::after { content: '↗'; font-size: 14px; } }
 </style>

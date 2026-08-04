@@ -146,6 +146,7 @@ async function main() {
       await page.locator('.modal-card').waitFor({ state: 'detached' })
     }
     await navigate('.primary-nav a[href="/settings/general"]', '/settings/general', '.settings-layout', 'settings')
+    await navigate('.section-tabs a[href="/settings/site-types"]', '/settings/site-types', '.type-rows', 'site type settings')
     await navigate('.section-tabs a[href="/settings/schedules"]', '/settings/schedules', '.schedule-settings', 'schedule settings')
     await navigate('.section-tabs a[href="/settings/data"]', '/settings/data', '.backup-table', 'backup settings')
     await navigate('.section-tabs a[href="/settings/notifications"]', '/settings/notifications', '.settings-content section.card', 'notification settings')
