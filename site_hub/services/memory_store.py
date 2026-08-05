@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
@@ -134,6 +135,9 @@ class MemoryStore:
 
     def _public_site(self, row):
         result = deepcopy(row)
+        result.setdefault("visit_count", 0)
+        result.setdefault("last_visited_at", None)
+        result.setdefault("overview_hidden", False)
         type_row = self.site_types.get(UUID(str(result["site_type_id"])))
         result["site_type"] = self._public_site_type(type_row) if type_row else None
         return result
@@ -257,16 +261,24 @@ class MemoryStore:
         row=self.sites.get(UUID(str(site_id)))
         return self._public_site(row) if row and row.get("status")!="archived" else None
 
+    async def get_site_runtime(self, site_id):
+        return await self.get_site(site_id)
+
     async def create_site(self, payload):
         async with self._lock:
             site_id = uuid4()
+            endpoint_id = uuid4()
             site_type = self._resolve_site_type(
                 site_type_id=payload.get("site_type_id"), kind=payload.get("kind"),
             )
             row = {"id": site_id, "favicon_path": None, "tags": [], "checkin_account_count": 0,
                    "product_count": 0, "adapter": None, "config": {}, "configured": False,
                    "configured_secret_fields": [], "created_at": _now().isoformat(),
-                   "updated_at": None, **payload,
+                   "updated_at": None, "folder_id": self.ROOT_FOLDER_ID,
+                   "status": "active", "pinned": False, "visit_count": 0,
+                   "last_visited_at": None, "overview_hidden": False,
+                   "row_version": 1,
+                   "default_endpoint_id": endpoint_id, **payload,
                    "site_type_id": site_type["id"], "kind": site_type["slug"]}
             row.pop("tag_ids", None)
             self.sites[site_id] = row
@@ -278,6 +290,15 @@ class MemoryStore:
         site_id = UUID(str(site_id))
         if site_id not in self.sites: return None
         payload = dict(payload); payload.pop("tag_ids", None)
+        allowed = {
+            "folder_id", "name", "url", "origin", "canonical_host", "kind",
+            "site_type_id", "capabilities", "description", "note", "icon",
+            "favicon_path", "status", "pinned", "sort_order", "overview_hidden",
+            "adapter", "config", "clear_secrets",
+        }
+        unsupported = set(payload) - allowed
+        if unsupported:
+            raise ValueError(f"unsupported site field: {sorted(unsupported)[0]}")
         if "site_type_id" in payload or "kind" in payload:
             if "site_type_id" in payload and payload["site_type_id"] is None:
                 raise SiteTypeConflict("A site must have a primary type", code="SITE_TYPE_REQUIRED")
@@ -306,8 +327,126 @@ class MemoryStore:
             remaining = set(self.sites[site_id].get("configured_secret_fields", [])) - clear_secrets
             payload["configured_secret_fields"] = sorted(remaining)
             payload["configured"] = bool(self.sites[site_id].get("config") or remaining)
+        for key in ("pinned", "overview_hidden"):
+            if key in payload:
+                payload[key] = bool(payload[key])
         self.sites[site_id].update(payload); self.sites[site_id]["updated_at"] = _now().isoformat()
         return self._public_site(self.sites[site_id])
+
+    async def list_overview_sites(self, *, limit=8):
+        limit = max(1, min(int(limit), 24))
+        now = _now()
+        rows = [
+            self._public_site(row) for row in self.sites.values()
+            if row.get("status", "active") not in {"archived", "disabled"}
+            and not bool(row.get("overview_hidden", False))
+        ]
+
+        def moment(value):
+            if value in (None, ""):
+                return None
+            try:
+                return _moment(value)
+            except (TypeError, ValueError):
+                return None
+
+        def timestamp(value):
+            value = moment(value)
+            return value.timestamp() if value is not None else 0.0
+
+        def score(row):
+            count = max(0, int(row.get("visit_count") or 0))
+            visited = moment(row.get("last_visited_at"))
+            if count == 0 or visited is None:
+                return 0.0
+            age_days = max(0.0, (now - visited).total_seconds() / 86400.0)
+            return math.log1p(count) * (0.5 ** (age_days / 30.0))
+
+        pinned = [row for row in rows if bool(row.get("pinned"))]
+        used = [
+            row for row in rows
+            if not bool(row.get("pinned"))
+            and (int(row.get("visit_count") or 0) > 0 or row.get("last_visited_at"))
+        ]
+        starters = [
+            row for row in rows
+            if not bool(row.get("pinned"))
+            and int(row.get("visit_count") or 0) == 0
+            and not row.get("last_visited_at")
+        ]
+        created_key = lambda row: (timestamp(row.get("created_at")), str(row["id"]))
+        frequent = (
+            sorted(
+                pinned,
+                key=lambda row: (score(row), timestamp(row.get("last_visited_at")), *created_key(row)),
+                reverse=True,
+            )
+            + sorted(
+                used,
+                key=lambda row: (score(row), timestamp(row.get("last_visited_at")), *created_key(row)),
+                reverse=True,
+            )
+            + sorted(starters, key=created_key, reverse=True)
+        )[:limit]
+        recent = sorted(
+            (row for row in rows if row.get("last_visited_at")),
+            key=lambda row: (timestamp(row.get("last_visited_at")), *created_key(row)),
+            reverse=True,
+        )[:limit]
+
+        def recommend(row, reason):
+            result = deepcopy(row)
+            result["recommendation_reason"] = "pinned" if row.get("pinned") else reason
+            return result
+
+        return {
+            "frequent": [
+                recommend(row, "frequent" if int(row.get("visit_count") or 0) > 0 else "starter")
+                for row in frequent
+            ],
+            "recent": [
+                {**deepcopy(row), "recommendation_reason": "recent"} for row in recent
+            ],
+            "has_usage": any(
+                int(row.get("visit_count") or 0) > 0 or row.get("last_visited_at")
+                for row in self.sites.values()
+            ),
+        }
+
+    async def record_site_visit(self, site_id):
+        identifier = UUID(str(site_id))
+        async with self._lock:
+            row = self.sites.get(identifier)
+            if row is None or row.get("status") == "archived":
+                return False
+            row["visit_count"] = int(row.get("visit_count") or 0) + 1
+            row["last_visited_at"] = _now().isoformat()
+            row["row_version"] = int(row.get("row_version") or 0) + 1
+            row["updated_at"] = _now().isoformat()
+            return True
+
+    async def reset_site_usage(self):
+        changed = 0
+        async with self._lock:
+            for row in self.sites.values():
+                if int(row.get("visit_count") or 0) != 0 or row.get("last_visited_at") is not None:
+                    row["visit_count"] = 0
+                    row["last_visited_at"] = None
+                    row["row_version"] = int(row.get("row_version") or 0) + 1
+                    row["updated_at"] = _now().isoformat()
+                    changed += 1
+        return changed
+
+    async def get_endpoint_runtime(self, endpoint_id):
+        wanted = UUID(str(endpoint_id))
+        for row in self.sites.values():
+            candidate = row.get("default_endpoint_id")
+            if candidate is not None and UUID(str(candidate)) == wanted:
+                return {
+                    "id": wanted, "site_id": row["id"], "role": "home",
+                    "label": "", "url": row["url"],
+                }
+        return None
 
     async def delete_site(self, site_id):
         site_id = UUID(str(site_id))

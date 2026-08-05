@@ -5,7 +5,7 @@ import AsyncState from '@/components/AsyncState.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import { api, apiErrorMessage } from '@/api/client'
 import type { Site } from '@/api/types'
-import { safeExternalUrl, hostname } from '@/utils/format'
+import { hostname } from '@/utils/format'
 import { siteTypeIcon } from '@/utils/siteType'
 import { useAppStore } from '@/stores/app'
 import { siteDetailKey } from './siteContext'
@@ -24,12 +24,7 @@ async function load() {
 async function openSite() {
   if (!site.value) return
   try {
-    if (site.value.default_endpoint_id) {
-      await api.post<void>(`/endpoints/${site.value.default_endpoint_id}/open`)
-      return
-    }
-    const safe = safeExternalUrl(site.value.url)
-    if (safe) window.open(safe, '_blank', 'noopener,noreferrer')
+    await api.post<void>(`/sites/${site.value.id}/open`)
   } catch (value) { app.toast(apiErrorMessage(value), 'error') }
 }
 provide(siteDetailKey, { site, refresh: load })
@@ -41,7 +36,7 @@ watch(() => route.params.siteId, load, { immediate: true })
     <template v-if="site">
       <header class="site-detail-header">
         <div class="site-identity"><span class="site-icon large">{{ site.name.slice(0, 1).toUpperCase() }}</span><div><div class="row"><h1>{{ site.name }}</h1><StatusBadge :status="site.status" /><span v-if="site.site_type" class="site-type" :style="{ color: site.site_type.color || '#6e7078', borderColor: `${site.site_type.color || '#6e7078'}55`, background: `${site.site_type.color || '#6e7078'}12` }"><span v-if="site.site_type.icon">{{ siteTypeIcon(site.site_type.icon) }}</span>{{ site.site_type.name }}</span></div><p>{{ hostname(site.url) }}</p></div></div>
-        <div class="page-actions"><button v-if="site.default_endpoint_id || safeExternalUrl(site.url)" class="button secondary" @click="openSite">访问网站 ↗</button></div>
+        <div class="page-actions"><button v-if="site.url" class="button secondary" @click="openSite">访问网站 ↗</button></div>
       </header>
       <nav class="tabs site-tabs" aria-label="网站详情">
         <RouterLink :to="`/sites/${site.id}/overview`">概览</RouterLink><RouterLink :to="`/sites/${site.id}/products`">商品</RouterLink><RouterLink :to="`/sites/${site.id}/accounts`">签到账号</RouterLink><RouterLink :to="`/sites/${site.id}/activity`">活动</RouterLink><RouterLink :to="`/sites/${site.id}/settings`">设置</RouterLink>

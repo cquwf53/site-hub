@@ -12,7 +12,7 @@ import { useSiteDetail } from './siteContext'
 interface ProductSettings { enabled: boolean; interval_override_minutes: number | null; effective_interval_minutes?: number; scraper_type?: string; config?: Record<string, unknown>; configured_secret_fields?: string[]; [key: string]: unknown }
 const { site, refresh } = useSiteDetail(); const app = useAppStore(); const router = useRouter()
 const folders = ref<Folder[]>([]); const tags = ref<Tag[]>([]); const siteTypes = ref<SiteType[]>([]); const manifests = ref<AdapterManifest[]>([]); const product = ref<ProductSettings>({ enabled: false, interval_override_minutes: null })
-const basic = ref({ name: '', url: '', folder_id: null as string | null, site_type_id: null as string | null, description: '', note: '', pinned: false, tag_ids: [] as string[] })
+const basic = ref({ name: '', url: '', folder_id: null as string | null, site_type_id: null as string | null, description: '', note: '', pinned: false, overview_hidden: false, tag_ids: [] as string[] })
 const adapter = ref({ id: '', config: {} as Record<string, unknown>, clear_secrets: [] as string[] }); const configuredAdapterSecrets = ref<string[]>([]); const saving = ref(''); const deleteOpen = ref(false)
 const productManifests = computed(() => manifests.value.filter((item) => item.capabilities.includes('product_monitor')))
 const manifest = computed(() => productManifests.value.find((item) => item.id === adapter.value.id))
@@ -20,7 +20,7 @@ const availableSiteTypes = computed(() => siteTypes.value.filter((item) => item.
 
 async function load() {
   if (!site.value) return
-  basic.value = { name: site.value.name, url: site.value.url, folder_id: site.value.folder_id, site_type_id: site.value.site_type_id || null, description: site.value.description || '', note: site.value.note || '', pinned: site.value.pinned, tag_ids: site.value.tags?.map((tag) => tag.id) || [] }
+  basic.value = { name: site.value.name, url: site.value.url, folder_id: site.value.folder_id, site_type_id: site.value.site_type_id || null, description: site.value.description || '', note: site.value.note || '', pinned: site.value.pinned, overview_hidden: Boolean(site.value.overview_hidden), tag_ids: site.value.tags?.map((tag) => tag.id) || [] }
   adapter.value = { id: site.value.adapter || '', config: structuredClone(site.value.config || {}), clear_secrets: [] }
   configuredAdapterSecrets.value = site.value.configured_secret_fields || []
   try {
@@ -49,6 +49,7 @@ onMounted(load)
       <div class="field span-2"><label for="settings-tags">标签</label><select id="settings-tags" v-model="basic.tag_ids" multiple><option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.name }}</option></select><p class="field-help">主类型用于统一分类，标签可跨类型补充多个维度。</p></div>
       <div class="field span-2"><label for="settings-description">简介</label><textarea id="settings-description" v-model="basic.description" /></div><div class="field span-2"><label for="settings-note">私人备注</label><textarea id="settings-note" v-model="basic.note" /></div>
       <div class="switch-row span-2"><div><div class="field-label">置顶网站</div><p class="field-help">在网站列表中优先显示。</p></div><button type="button" class="switch" :class="{ on: basic.pinned }" :aria-pressed="basic.pinned" @click="basic.pinned = !basic.pinned" /></div>
+      <div class="switch-row span-2"><div><div class="field-label">在总览快捷访问中显示</div><p class="field-help">关闭后不会出现在“常用”或“最近”中，可随时重新开启。</p></div><button type="button" class="switch overview-visibility-switch" :class="{ on: !basic.overview_hidden }" :aria-pressed="!basic.overview_hidden" aria-label="在总览快捷访问中显示" @click="basic.overview_hidden = !basic.overview_hidden" /></div>
       <div class="form-actions span-2"><button class="button" :disabled="saving === 'basic'">{{ saving === 'basic' ? '保存中…' : '保存基本信息' }}</button></div>
     </form></section>
     <section v-if="productManifests.length" class="card"><div class="card-header"><div><h2>网站适配器</h2><p class="subtle-text">普通配置可编辑；密钥只显示是否已配置，账号凭据仍在“签到账号”中单独管理</p></div></div><form class="card-body stack" @submit.prevent="saveAdapter"><div class="field"><label for="site-adapter">适配器</label><select id="site-adapter" v-model="adapter.id"><option value="">无专用适配器</option><option v-for="item in productManifests" :key="item.id" :value="item.id">{{ item.name || item.id }} · v{{ item.version }}</option></select></div><DynamicSchemaForm v-if="manifest" v-model="adapter.config" v-model:clear-secrets="adapter.clear_secrets" :schema="manifest.site_config_schema" :ui-schema="manifest.ui_schema" :secret-fields="manifest.secret_fields" :configured-secret-fields="configuredAdapterSecrets" :disabled="saving === 'adapter'" /><div class="form-actions"><button class="button" :disabled="saving === 'adapter'">保存适配器配置</button></div></form></section>

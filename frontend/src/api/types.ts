@@ -69,6 +69,7 @@ export interface Site {
   note?: string | null
   icon?: string | null
   pinned: boolean
+  overview_hidden?: boolean
   sort_order?: number
   visit_count?: number
   last_visited_at?: string | null
@@ -82,6 +83,18 @@ export interface Site {
   config?: Record<string, unknown>
   configured?: boolean
   configured_secret_fields?: string[]
+}
+
+export type SiteRecommendationReason = 'pinned' | 'frequent' | 'recent' | 'starter'
+
+export interface SiteQuickAccess extends Site {
+  recommendation_reason: SiteRecommendationReason
+}
+
+export interface OverviewSites {
+  frequent: SiteQuickAccess[]
+  recent: SiteQuickAccess[]
+  has_usage: boolean
 }
 
 export type AuthState = 'not_configured' | 'unverified' | 'opening' | 'awaiting_user' | 'verifying' | 'ready' | 'expired' | 'error'

@@ -464,10 +464,16 @@ V3_STATEMENTS = (
 )
 
 
+V4_STATEMENTS = (
+    "ALTER TABLE sites ADD COLUMN overview_hidden INTEGER NOT NULL DEFAULT 0 CHECK(overview_hidden IN (0,1))",
+)
+
+
 MIGRATIONS = (
     Migration(1, "initial-unified-schema", V1_STATEMENTS),
     Migration(2, "preserve-manual-product-categories", V2_STATEMENTS),
     Migration(3, "controlled-site-types", V3_STATEMENTS),
+    Migration(4, "overview-site-preferences", V4_STATEMENTS),
 )
 SCHEMA_VERSION = MIGRATIONS[-1].version
 

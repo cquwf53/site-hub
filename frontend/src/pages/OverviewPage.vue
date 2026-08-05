@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import AsyncState from '@/components/AsyncState.vue'
+import QuickAccessPanel from '@/components/QuickAccessPanel.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import { ApiError, api, apiErrorMessage } from '@/api/client'
 import type { InboxEvent, Job, Page, Product, Site } from '@/api/types'
@@ -142,6 +143,7 @@ onMounted(load)
       </div>
       <RouterLink class="text-button" to="/settings/schedules">调度设置</RouterLink>
     </section>
+    <QuickAccessPanel />
     <div class="grid two overview-sections">
       <section class="card">
         <div class="card-header"><div><h2>需要留意</h2><p class="subtle-text">最近未归档的消息</p></div><RouterLink class="text-button" to="/inbox">全部消息</RouterLink></div>
