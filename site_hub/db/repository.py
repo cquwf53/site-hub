@@ -228,7 +228,7 @@ class SiteHubRepository:
         allowed = {
             "folder_id", "name", "origin", "canonical_host", "kind", "site_type_id", "status",
             "description", "note", "icon", "favicon_path", "pinned", "sort_order",
-            "visit_count", "last_visited_at",
+            "overview_hidden",
         }
         unsupported = set(changes) - allowed
         if unsupported:
@@ -250,7 +250,7 @@ class SiteHubRepository:
                 changes["kind"] = site_type["slug"]
             fields, values = [], []
             for key, value in changes.items():
-                if key == "pinned":
+                if key in {"pinned", "overview_hidden"}:
                     value = int(bool(value))
                 fields.append(f"{key}=?")
                 values.append(value)

@@ -1,4 +1,5 @@
 import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import OverviewPage from './OverviewPage.vue'
 
@@ -30,6 +31,7 @@ function installResponses(batch: (() => Promise<unknown>) | null) {
     if (path === '/schedules/checkin-batch/today') {
       return batch ? batch() : Promise.resolve(todayBatch)
     }
+    if (path === '/overview/sites') return Promise.resolve({ frequent: [], recent: [], has_usage: false })
     if (['/sites', '/products', '/events', '/jobs'].includes(path)) return Promise.resolve({ ...emptyPage })
     throw new Error(`unexpected GET ${path}`)
   })
@@ -37,7 +39,7 @@ function installResponses(batch: (() => Promise<unknown>) | null) {
 
 async function renderPage() {
   const wrapper = mount(OverviewPage, {
-    global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    global: { plugins: [createPinia()], stubs: { RouterLink: { template: '<a><slot /></a>' } } },
   })
   await flushPromises()
   return wrapper
@@ -45,6 +47,7 @@ async function renderPage() {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  setActivePinia(createPinia())
   installResponses(null)
 })
 

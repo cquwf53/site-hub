@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from datetime import UTC, datetime
@@ -28,6 +29,7 @@ from site_hub.services.ports import SiteTypeConflict
 
 
 router = APIRouter(prefix="/api/v1")
+logger = logging.getLogger(__name__)
 
 
 def _store(request: Request):
@@ -93,6 +95,31 @@ def _page(items: list[dict[str, Any]], page: int, page_size: int, total: int) ->
 
 def _task_json(task) -> dict[str, Any]:
     return task.model_dump(mode="json", by_alias=True)
+
+
+def _validated_open_url(value: Any) -> str:
+    url = str(value)
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise HTTPException(400, detail={
+            "code": "INVALID_ENDPOINT",
+            "message": "Endpoint URL is not safe to open",
+        })
+    return url
+
+
+def _launch_url(url: str) -> None:
+    if sys.platform == "win32":
+        os.startfile(url)  # type: ignore[attr-defined]
+        return
+    import webbrowser
+    if not webbrowser.open(url, new=2):
+        raise RuntimeError("no browser accepted the endpoint")
 
 
 def _account_public(row: dict[str, Any]) -> dict[str, Any]:
@@ -226,11 +253,44 @@ async def bulk_set_site_type(request: Request, payload: SiteTypeBulkAssignment):
         _raise_site_type_conflict(exc)
 
 
+@router.get("/overview/sites")
+async def overview_sites(request: Request, limit: int = Query(8, ge=1, le=24)):
+    return await _store(request).list_overview_sites(limit=limit)
+
+
+@router.post("/overview/sites/reset-usage")
+async def reset_overview_site_usage(request: Request):
+    return {"reset": await _store(request).reset_site_usage()}
+
+
 @router.get("/sites/{site_id}")
 async def get_site(request: Request, site_id: UUID):
     row = await _store(request).get_site(site_id)
     if not row: _not_found("Site not found")
     return row
+
+
+@router.post("/sites/{site_id}/open", status_code=204)
+async def open_site(request: Request, site_id: UUID):
+    runtime = await _store(request).get_site_runtime(site_id)
+    if not runtime:
+        _not_found("Site not found")
+    url = _validated_open_url(runtime["url"])
+    try:
+        await asyncio.to_thread(_launch_url, url)
+    except Exception:
+        raise HTTPException(503, detail={
+            "code": "BROWSER_OPEN_FAILED",
+            "message": "The system browser could not be opened",
+        }) from None
+    try:
+        await _store(request).record_site_visit(site_id)
+    except Exception:
+        # The browser has already accepted the external side effect. Treat the
+        # preference counter as best-effort so a retry cannot open a duplicate
+        # tab merely because the local usage write failed.
+        logger.exception("failed to record browser-open usage for site %s", site_id)
+    return Response(status_code=204)
 
 
 @router.patch("/sites/{site_id}")
@@ -346,17 +406,8 @@ async def open_endpoint(request: Request, endpoint_id: UUID):
     method = getattr(_store(request), "get_endpoint_runtime", None)
     endpoint = await method(endpoint_id) if method else None
     if not endpoint: _not_found("Endpoint not found")
-    url = str(endpoint["url"])
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None:
-        raise HTTPException(400, detail={"code": "INVALID_ENDPOINT", "message": "Endpoint URL is not safe to open"})
-
-    def launch() -> None:
-        if sys.platform == "win32": os.startfile(url)  # type: ignore[attr-defined]
-        else:
-            import webbrowser
-            if not webbrowser.open(url, new=2): raise RuntimeError("no browser accepted the endpoint")
-    await asyncio.to_thread(launch)
+    url = _validated_open_url(endpoint["url"])
+    await asyncio.to_thread(_launch_url, url)
     return Response(status_code=204)
 
 

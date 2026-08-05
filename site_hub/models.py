@@ -101,6 +101,7 @@ class SiteUpdate(BaseModel):
     icon: str | None = Field(default=None, max_length=64)
     status: str | None = Field(default=None, max_length=32)
     pinned: bool | None = None
+    overview_hidden: bool | None = None
     tag_ids: list[UUID] | None = None
     adapter: str | None = Field(default=None, max_length=100)
     config: dict[str, Any] | None = None
@@ -129,6 +130,9 @@ class SiteOut(SiteBase):
     config: dict[str, Any] = Field(default_factory=dict)
     configured: bool = False
     configured_secret_fields: list[str] = Field(default_factory=list)
+    visit_count: int = 0
+    last_visited_at: str | None = None
+    overview_hidden: bool = False
     created_at: str | None = None
     updated_at: str | None = None
 

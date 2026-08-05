@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import sqlite3
 from datetime import UTC, datetime, time, timedelta
@@ -28,6 +29,15 @@ def _iso(value: datetime | str | None) -> str | None:
         return value
     value = value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _moment(value: datetime | str) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+        str(value).replace("Z", "+00:00")
+    )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _loads(value: Any, default: Any) -> Any:
@@ -482,6 +492,9 @@ class DataLayerStore:
             "site_type": site_type, "capabilities": capabilities or ["bookmark"],
             "description": row["description"], "note": row["note"], "icon": row["icon"],
             "status": row["status"], "pinned": bool(row["pinned"]),
+            "visit_count": int(row.get("visit_count") or 0),
+            "last_visited_at": row.get("last_visited_at"),
+            "overview_hidden": bool(row.get("overview_hidden", 0)),
             "favicon_path": row.get("favicon_path"), "tags": tags,
             "default_endpoint_id": row.get("default_endpoint_id"),
             "checkin_account_count": int(row.get("account_count") or 0),
@@ -568,7 +581,7 @@ class DataLayerStore:
         allowed = {
             "folder_id", "name", "origin", "canonical_host", "kind", "site_type_id", "status",
             "description", "note", "icon", "favicon_path", "pinned", "sort_order",
-            "visit_count", "last_visited_at",
+            "overview_hidden",
         }
         if "folder_id" in values and values["folder_id"] is None:
             values["folder_id"] = self.ROOT_FOLDER_ID
@@ -652,7 +665,7 @@ class DataLayerStore:
                 fields: list[str] = []
                 field_values: list[Any] = []
                 for key, value in values.items():
-                    if key == "pinned":
+                    if key in {"pinned", "overview_hidden"}:
                         value = int(bool(value))
                     elif key == "canonical_host":
                         value = str(value).lower()
@@ -727,6 +740,140 @@ class DataLayerStore:
             for secret_id in obsolete_secret_ids:
                 self.secret_service.delete_if_unreferenced(secret_id)
         return self._site_row(site_id)
+
+    async def list_overview_sites(self, *, limit: int = 8) -> dict[str, Any]:
+        return await self._call(self._list_overview_sites_sync, limit)
+
+    def _list_overview_sites_sync(self, limit: int) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 24))
+        now = datetime.now(UTC)
+        with self.database.connect() as conn:
+            has_usage = conn.execute(
+                """SELECT 1 FROM sites
+                   WHERE visit_count!=0 OR last_visited_at IS NOT NULL
+                   LIMIT 1"""
+            ).fetchone() is not None
+        rows = [
+            row for row in self._site_rows()
+            if row.get("status") not in {"archived", "disabled"}
+            and not bool(row.get("overview_hidden"))
+        ]
+
+        def moment(value: Any) -> datetime | None:
+            if value in (None, ""):
+                return None
+            try:
+                return _moment(value)
+            except (TypeError, ValueError):
+                return None
+
+        def created_timestamp(row: dict[str, Any]) -> float:
+            value = moment(row.get("created_at"))
+            return value.timestamp() if value is not None else 0.0
+
+        def visited_timestamp(row: dict[str, Any]) -> float:
+            value = moment(row.get("last_visited_at"))
+            return value.timestamp() if value is not None else 0.0
+
+        def score(row: dict[str, Any]) -> float:
+            count = max(0, int(row.get("visit_count") or 0))
+            visited = moment(row.get("last_visited_at"))
+            if count == 0 or visited is None:
+                return 0.0
+            age_days = max(0.0, (now - visited).total_seconds() / 86400.0)
+            return math.log1p(count) * (0.5 ** (age_days / 30.0))
+
+        pinned = [row for row in rows if bool(row.get("pinned"))]
+        unpinned_used = [
+            row for row in rows
+            if not bool(row.get("pinned"))
+            and (int(row.get("visit_count") or 0) > 0 or row.get("last_visited_at"))
+        ]
+        starters = [
+            row for row in rows
+            if not bool(row.get("pinned"))
+            and int(row.get("visit_count") or 0) == 0
+            and not row.get("last_visited_at")
+        ]
+        pinned_by_frequency = sorted(
+            pinned,
+            key=lambda row: (
+                score(row), visited_timestamp(row), created_timestamp(row), str(row["id"]),
+            ),
+            reverse=True,
+        )
+        frequent_rows = (
+            pinned_by_frequency
+            + sorted(
+                unpinned_used,
+                key=lambda row: (
+                    score(row), visited_timestamp(row), created_timestamp(row), str(row["id"]),
+                ),
+                reverse=True,
+            )
+            + sorted(
+                starters,
+                key=lambda row: (created_timestamp(row), str(row["id"])),
+                reverse=True,
+            )
+        )[:limit]
+        recent_rows = sorted(
+            (row for row in rows if row.get("last_visited_at")),
+            key=lambda row: (
+                visited_timestamp(row), created_timestamp(row), str(row["id"]),
+            ),
+            reverse=True,
+        )[:limit]
+
+        def recommend(row: dict[str, Any], reason: str) -> dict[str, Any]:
+            result = dict(row)
+            result["recommendation_reason"] = (
+                "pinned" if bool(row.get("pinned")) else reason
+            )
+            return result
+
+        return {
+            "frequent": [
+                recommend(
+                    row,
+                    "frequent" if int(row.get("visit_count") or 0) > 0 else "starter",
+                )
+                for row in frequent_rows
+            ],
+            "recent": [
+                {**row, "recommendation_reason": "recent"} for row in recent_rows
+            ],
+            "has_usage": has_usage,
+        }
+
+    async def record_site_visit(self, site_id: UUID) -> bool:
+        return await self._call(self._record_site_visit_sync, _uuid(site_id))
+
+    def _record_site_visit_sync(self, site_id: str) -> bool:
+        now = _iso(datetime.now(UTC))
+        with self.database.transaction(immediate=True) as conn:
+            changed = conn.execute(
+                """UPDATE sites
+                   SET visit_count=visit_count+1,last_visited_at=?,
+                       row_version=row_version+1,updated_at=?
+                   WHERE id=? AND status!='archived'""",
+                (now, now, site_id),
+            ).rowcount
+        return bool(changed)
+
+    async def reset_site_usage(self) -> int:
+        return await self._call(self._reset_site_usage_sync)
+
+    def _reset_site_usage_sync(self) -> int:
+        now = _iso(datetime.now(UTC))
+        with self.database.transaction(immediate=True) as conn:
+            return int(conn.execute(
+                """UPDATE sites
+                   SET visit_count=0,last_visited_at=NULL,
+                       row_version=row_version+1,updated_at=?
+                   WHERE visit_count!=0 OR last_visited_at IS NOT NULL""",
+                (now,),
+            ).rowcount)
 
     async def delete_site(self, site_id: UUID) -> bool:
         return await self._call(self._archive_site_sync, _uuid(site_id))

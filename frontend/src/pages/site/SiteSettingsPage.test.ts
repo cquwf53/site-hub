@@ -23,7 +23,7 @@ vi.mock('./siteContext', async () => {
     useSiteDetail: () => ({
       site: ref({
         id: 'site-1', name: 'Example', url: 'https://example.test', folder_id: null, site_type_id: 'type-other',
-        status: 'active', pinned: false, tags: [], capabilities: ['bookmark'],
+        status: 'active', pinned: false, overview_hidden: true, tags: [], capabilities: ['bookmark'],
       }),
       refresh: contextMocks.refresh,
     }),
@@ -77,5 +77,20 @@ describe('SiteSettingsPage website type', () => {
       site_type_id: 'type-tool',
     }))
     expect(contextMocks.refresh).toHaveBeenCalled()
+  })
+
+  it('can restore a hidden website to overview quick access', async () => {
+    const wrapper = await renderPage()
+    const visibilitySwitch = wrapper.get('button[aria-label="在总览快捷访问中显示"]')
+
+    expect(visibilitySwitch.attributes('aria-pressed')).toBe('false')
+    await visibilitySwitch.trigger('click')
+    expect(visibilitySwitch.attributes('aria-pressed')).toBe('true')
+    await wrapper.get('form.card-body').trigger('submit')
+    await flushPromises()
+
+    expect(apiMocks.patch).toHaveBeenCalledWith('/sites/site-1', expect.objectContaining({
+      overview_hidden: false,
+    }))
   })
 })

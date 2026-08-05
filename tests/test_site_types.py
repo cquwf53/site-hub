@@ -58,7 +58,7 @@ def test_v2_upgrade_preserves_known_and_unknown_site_kinds(tmp_path):
     apply_migrations(database)
 
     with database.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         rows = {
             row["slug"]: dict(row) for row in conn.execute(
                 "SELECT * FROM site_types WHERE slug IN ('shop','forum')"
@@ -137,7 +137,7 @@ def test_staged_v2_restore_is_upgraded_before_sitehub_becomes_ready(tmp_path):
         }
 
     with database.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert backups.pending_restore() is None
 
