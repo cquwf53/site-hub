@@ -3,9 +3,32 @@ import { computed, onMounted, ref } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import AsyncState from '@/components/AsyncState.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
-import { api, apiErrorMessage } from '@/api/client'
+import { ApiError, api, apiErrorMessage } from '@/api/client'
 import type { InboxEvent, Job, Page, Product, Site } from '@/api/types'
+import { SITEHUB_TIMEZONE } from '@/utils/accountSchedule'
 import { formatDate, formatMoney } from '@/utils/format'
+
+interface CheckinWindow {
+  timezone: string
+  checkin_window_start: string
+  checkin_window_end: string
+}
+
+interface CheckinBatch {
+  id: string
+  planned_at?: string | null
+  status: string
+  trigger_reason?: string
+  items: { id: string; status: string }[]
+}
+
+const TERMINAL_ITEM_STATUSES = ['succeeded', 'failed', 'skipped', 'effect_unknown', 'cancelled']
+const clockFormat = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: SITEHUB_TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
+})
+const preciseClockFormat = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: SITEHUB_TIMEZONE, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+})
 
 const loading = ref(true)
 const error = ref('')
@@ -13,17 +36,78 @@ const sites = ref<Page<Site>>({ items: [], page: 1, page_size: 1, total: 0 })
 const products = ref<Page<Product>>({ items: [], page: 1, page_size: 1, total: 0 })
 const events = ref<Page<InboxEvent>>({ items: [], page: 1, page_size: 6, total: 0 })
 const jobs = ref<Page<Job>>({ items: [], page: 1, page_size: 6, total: 0 })
+const checkinWindow = ref<CheckinWindow | null>(null)
+const checkinBatch = ref<CheckinBatch | null>(null)
+const checkinError = ref('')
 const activeJobs = computed(() => jobs.value.items.filter((job) => ['queued', 'leased', 'running'].includes(job.status)))
+
+function plannedDate() {
+  const value = checkinBatch.value?.planned_at
+  if (!value) return null
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+const plannedClock = computed(() => {
+  const date = plannedDate()
+  return date ? clockFormat.format(date) : '—'
+})
+
+const plannedTitle = computed(() => {
+  const date = plannedDate()
+  return date ? `上海时间 ${preciseClockFormat.format(date)}` : ''
+})
+
+const windowRange = computed(() => {
+  const value = checkinWindow.value
+  if (!value) return ''
+  return `${value.checkin_window_start.slice(0, 5)}–${value.checkin_window_end.slice(0, 5)}`
+})
+
+const planNote = computed(() => {
+  if (checkinError.value) return `今日批次读取失败：${checkinError.value}`
+  const range = windowRange.value ? `${windowRange.value} 内随机` : '签到窗口内随机'
+  if (!checkinBatch.value) return `今日尚未安排，${range}，调度器就绪后自动生成`
+  return `${range} · ${checkinWindow.value?.timezone || SITEHUB_TIMEZONE}`
+})
+
+const checkinProgress = computed(() => {
+  const items = checkinBatch.value?.items || []
+  return { done: items.filter((item) => TERMINAL_ITEM_STATUSES.includes(item.status)).length, total: items.length }
+})
+
+async function loadCheckinPlan() {
+  try {
+    const [windowValue, batchValue] = await Promise.all([
+      api.get<CheckinWindow>('/settings/schedules'),
+      // The daily batch only exists after the scheduler's first tick of the
+      // Shanghai day, so a missing plan is a normal state, not a page failure.
+      api.get<CheckinBatch>('/schedules/checkin-batch/today').catch((value) => {
+        if (value instanceof ApiError && value.status === 404) return null
+        throw value
+      }),
+    ])
+    checkinWindow.value = windowValue; checkinBatch.value = batchValue; checkinError.value = ''
+  } catch (value) {
+    checkinBatch.value = null; checkinError.value = apiErrorMessage(value)
+  }
+}
 
 async function load() {
   loading.value = true; error.value = ''
   try {
-    ;[sites.value, products.value, events.value, jobs.value] = await Promise.all([
-      api.get<Page<Site>>('/sites', { page: 1, page_size: 5 }),
-      api.get<Page<Product>>('/products', { page: 1, page_size: 5 }),
-      api.get<Page<InboxEvent>>('/events', { page: 1, page_size: 6, dismissed: false }),
-      api.get<Page<Job>>('/jobs', { page: 1, page_size: 6 }),
+    // The check-in plan resolves its own failures so an unplanned day never
+    // replaces the whole overview with an error state.
+    const [core] = await Promise.all([
+      Promise.all([
+        api.get<Page<Site>>('/sites', { page: 1, page_size: 5 }),
+        api.get<Page<Product>>('/products', { page: 1, page_size: 5 }),
+        api.get<Page<InboxEvent>>('/events', { page: 1, page_size: 6, dismissed: false }),
+        api.get<Page<Job>>('/jobs', { page: 1, page_size: 6 }),
+      ]),
+      loadCheckinPlan(),
     ])
+    ;[sites.value, products.value, events.value, jobs.value] = core
   } catch (value) { error.value = apiErrorMessage(value) }
   finally { loading.value = false }
 }
@@ -41,6 +125,23 @@ onMounted(load)
       <article class="card metric-card"><div class="metric-label">待处理消息</div><div class="metric-value">{{ events.total }}</div><div class="metric-note">价格、库存与运行异常</div></article>
       <article class="card metric-card"><div class="metric-label">进行中任务</div><div class="metric-value">{{ activeJobs.length }}</div><div class="metric-note">排队与运行中的自动化</div></article>
     </div>
+    <section class="card checkin-plan">
+      <span class="plan-icon">签</span>
+      <div class="plan-body">
+        <div class="plan-label">今日签到时间</div>
+        <div class="plan-headline">
+          <strong :title="plannedTitle">{{ plannedClock }}</strong>
+          <StatusBadge v-if="checkinBatch" :status="checkinBatch.status" />
+          <span v-if="checkinBatch?.trigger_reason === 'regenerated'" class="plan-flag">错过后已顺延</span>
+        </div>
+        <p class="plan-note">{{ planNote }}</p>
+      </div>
+      <div v-if="checkinBatch && checkinProgress.total" class="plan-progress">
+        <strong>{{ checkinProgress.done }}/{{ checkinProgress.total }}</strong>
+        <small>账号已执行</small>
+      </div>
+      <RouterLink class="text-button" to="/settings/schedules">调度设置</RouterLink>
+    </section>
     <div class="grid two overview-sections">
       <section class="card">
         <div class="card-header"><div><h2>需要留意</h2><p class="subtle-text">最近未归档的消息</p></div><RouterLink class="text-button" to="/inbox">全部消息</RouterLink></div>
@@ -78,6 +179,17 @@ onMounted(load)
 <style scoped>
 .overview-metrics { margin-bottom: 17px; }
 .overview-sections { margin-bottom: 17px; }
+.checkin-plan { display: flex; align-items: center; gap: 16px; margin-bottom: 17px; padding: 16px 20px; }
+.plan-icon { display: grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center; border-radius: 9px; color: var(--accent); background: var(--accent-soft); font-size: 12px; font-weight: 700; }
+.plan-body { min-width: 0; flex: 1; }
+.plan-label { color: var(--muted); font-size: 13px; }
+.plan-headline { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin: 5px 0 4px; }
+.plan-headline strong { font-size: 26px; font-weight: 650; letter-spacing: -.04em; line-height: 1; }
+.plan-flag { color: var(--warning); font-size: 11px; }
+.plan-note { overflow: hidden; margin: 0; color: var(--subtle); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.plan-progress { flex: 0 0 auto; text-align: right; }
+.plan-progress strong { display: block; font-size: 15px; font-weight: 650; }
+.plan-progress small { color: var(--subtle); font-size: 11px; }
 .card-header p { margin-top: 3px; }
 .feed-list { display: flex; flex-direction: column; }
 .feed-item { display: grid; min-height: 69px; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; padding: 10px 18px; border-bottom: 1px solid var(--line); }
@@ -97,5 +209,10 @@ onMounted(load)
 .compact-product strong, .compact-product small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compact-product strong { font-size: 13px; }.compact-product small { color: var(--muted); }.compact-product b { font-size: 14px; }
 @media (max-width: 1100px) { .compact-product-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }.compact-product { border-bottom: 1px solid var(--line); } }
-@media (max-width: 620px) { .compact-product-grid { grid-template-columns: 1fr 1fr; }.feed-item time { display: none; } }
+@media (max-width: 620px) {
+  .compact-product-grid { grid-template-columns: 1fr 1fr; }.feed-item time { display: none; }
+  .checkin-plan { flex-wrap: wrap; }
+  .plan-body { flex-basis: calc(100% - 50px); }
+  .plan-progress { text-align: left; }
+}
 </style>
