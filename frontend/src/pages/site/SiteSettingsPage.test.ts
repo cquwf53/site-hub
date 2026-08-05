@@ -24,6 +24,7 @@ vi.mock('./siteContext', async () => {
       site: ref({
         id: 'site-1', name: 'Example', url: 'https://example.test', folder_id: null, site_type_id: 'type-other',
         status: 'active', pinned: false, overview_hidden: true, tags: [], capabilities: ['bookmark'],
+        adapter: 'test-scraper', config: { selector: '.from-site' },
       }),
       refresh: contextMocks.refresh,
     }),
@@ -31,6 +32,10 @@ vi.mock('./siteContext', async () => {
 })
 
 const typeBase = { color: '#6976d9', icon: 'globe', sort_order: 0, enabled: true, is_system: true, is_default: false, site_count: 0 }
+const adapterManifest = {
+  id: 'test-scraper', name: 'Test scraper', version: '1.0.0', capabilities: ['product_monitor'], secret_fields: [],
+  site_config_schema: { type: 'object', properties: { selector: { type: 'string', title: '商品选择器' } } },
+}
 
 async function renderPage() {
   const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { template: '<div />' } }] })
@@ -47,13 +52,19 @@ beforeEach(() => {
   vi.clearAllMocks()
   setActivePinia(createPinia())
   apiMocks.get.mockImplementation((path: string) => {
-    if (path === '/folders' || path === '/tags' || path === '/adapters') return Promise.resolve([])
+    if (path === '/folders' || path === '/tags') return Promise.resolve([])
+    if (path === '/adapters') return Promise.resolve([adapterManifest])
     if (path === '/site-types') return Promise.resolve([
       { ...typeBase, id: 'type-other', name: '其他', slug: 'other', is_default: true },
       { ...typeBase, id: 'type-tool', name: '工具', slug: 'tool' },
       { ...typeBase, id: 'type-disabled', name: '旧分类', slug: 'disabled', enabled: false, is_system: false },
     ])
-    if (path === '/sites/site-1/product-settings') return Promise.resolve({ enabled: false, interval_override_minutes: null })
+    if (path === '/sites/site-1/product-settings') return Promise.resolve({
+      enabled: false,
+      interval_override_minutes: null,
+      scraper_type: 'test-scraper',
+      config: { selector: '.from-product' },
+    })
     throw new Error(`unexpected GET ${path}`)
   })
   apiMocks.patch.mockResolvedValue({})
@@ -92,5 +103,12 @@ describe('SiteSettingsPage website type', () => {
     expect(apiMocks.patch).toHaveBeenCalledWith('/sites/site-1', expect.objectContaining({
       overview_hidden: false,
     }))
+  })
+
+  it('loads reactive site and product adapter configs without a DataCloneError', async () => {
+    const wrapper = await renderPage()
+
+    expect((wrapper.get('#schema-selector').element as HTMLInputElement).value).toBe('.from-product')
+    expect(apiMocks.get).toHaveBeenCalledWith('/sites/site-1/product-settings')
   })
 })
