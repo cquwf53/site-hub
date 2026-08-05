@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, toRaw } from 'vue'
 import { useRouter } from 'vue-router'
 import DynamicSchemaForm from '@/components/DynamicSchemaForm.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
@@ -18,17 +18,24 @@ const productManifests = computed(() => manifests.value.filter((item) => item.ca
 const manifest = computed(() => productManifests.value.find((item) => item.id === adapter.value.id))
 const availableSiteTypes = computed(() => siteTypes.value.filter((item) => item.enabled || item.id === basic.value.site_type_id))
 
+function cloneConfig(value?: Record<string, unknown>) {
+  // Values read from refs are Vue proxies, which the browser structured clone
+  // algorithm rejects with DataCloneError. Adapter configs are JSON data, so
+  // unwrap the proxy before making the editable copy.
+  return structuredClone(toRaw(value || {}))
+}
+
 async function load() {
   if (!site.value) return
   basic.value = { name: site.value.name, url: site.value.url, folder_id: site.value.folder_id, site_type_id: site.value.site_type_id || null, description: site.value.description || '', note: site.value.note || '', pinned: site.value.pinned, overview_hidden: Boolean(site.value.overview_hidden), tag_ids: site.value.tags?.map((tag) => tag.id) || [] }
-  adapter.value = { id: site.value.adapter || '', config: structuredClone(site.value.config || {}), clear_secrets: [] }
+  adapter.value = { id: site.value.adapter || '', config: cloneConfig(site.value.config), clear_secrets: [] }
   configuredAdapterSecrets.value = site.value.configured_secret_fields || []
   try {
     ;[folders.value, tags.value, siteTypes.value, manifests.value] = await Promise.all([api.get<Folder[]>('/folders'), api.get<Tag[]>('/tags'), api.get<SiteType[]>('/site-types'), api.get<AdapterManifest[]>('/adapters')])
     product.value = await api.get<ProductSettings>(`/sites/${site.value.id}/product-settings`)
     adapter.value = {
       id: product.value.scraper_type === 'none' ? '' : product.value.scraper_type || adapter.value.id,
-      config: structuredClone(product.value.config || adapter.value.config),
+      config: cloneConfig(product.value.config || adapter.value.config),
       clear_secrets: [],
     }
     configuredAdapterSecrets.value = product.value.configured_secret_fields || configuredAdapterSecrets.value
