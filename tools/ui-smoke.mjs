@@ -148,7 +148,11 @@ async function main() {
     await navigate('.primary-nav a[href="/settings/general"]', '/settings/general', '.settings-layout', 'settings')
     await navigate('.section-tabs a[href="/settings/site-types"]', '/settings/site-types', '.type-rows', 'site type settings')
     await navigate('.section-tabs a[href="/settings/schedules"]', '/settings/schedules', '.schedule-settings', 'schedule settings')
-    await navigate('.section-tabs a[href="/settings/data"]', '/settings/data', '.backup-table', 'backup settings')
+    // A fresh isolated database has no backup rows, so AsyncState intentionally
+    // replaces the table with its empty state. The create action is the stable
+    // page marker in both the empty and populated cases; waitForPage still waits
+    // for the loading panel to detach before checking browser/API errors.
+    await navigate('.section-tabs a[href="/settings/data"]', '/settings/data', '[data-testid="create-backup"]', 'backup settings')
     await navigate('.section-tabs a[href="/settings/notifications"]', '/settings/notifications', '.settings-content section.card', 'notification settings')
     await navigate('.primary-nav a[href="/automations/jobs"]', '/automations/jobs', '.automation-tabs + .toolbar', 'automation jobs')
 

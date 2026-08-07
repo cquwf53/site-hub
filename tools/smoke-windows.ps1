@@ -14,6 +14,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$requirementsLock = Join-Path $projectRoot 'requirements.lock'
 $appUrl = 'http://127.0.0.1:8686'
 $readyUrl = "$appUrl/api/v1/health/ready"
 $systemTempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\')
@@ -391,8 +392,10 @@ try {
     $python = Resolve-SmokePython
     if (-not $SkipDependencyInstall) {
         Write-Step 'Installing Python dependencies and browser runtime.'
-        & $python -m pip install --disable-pip-version-check -r (Join-Path $projectRoot 'requirements.txt')
+        & $python -m pip install --disable-pip-version-check --no-deps '--only-binary=:all:' -r $requirementsLock
         Assert-True ($LASTEXITCODE -eq 0) 'Python dependency installation failed.'
+        & $python -m pip check
+        Assert-True ($LASTEXITCODE -eq 0) 'The locked Python dependency set is incomplete or inconsistent.'
         & $python -m playwright install chromium
         Assert-True ($LASTEXITCODE -eq 0) 'Python Playwright Chromium installation failed.'
 

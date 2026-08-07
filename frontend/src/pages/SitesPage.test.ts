@@ -24,6 +24,24 @@ const site = {
   id: 'site-1', folder_id: null, site_type_id: 'type-other', site_type: siteTypes[0], name: '示例站',
   url: 'https://example.com', status: 'active', pinned: false, tags: [], capabilities: ['bookmark'],
 }
+const folders = [
+  { id: '00000000-0000-0000-0000-000000000001', parent_id: null, name: 'Sites', sort_order: -1 },
+  { id: 'folder-guides', parent_id: null, name: '资料', sort_order: 0 },
+  { id: 'folder-tools', parent_id: null, name: '工具箱', sort_order: 1 },
+]
+let statsFailure: Error | null = null
+type DirectoryStats = { total: number; unfiled: number; by_folder: Record<string, number> }
+const statsQueue: Array<Promise<DirectoryStats>> = []
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+  return { promise, resolve, reject }
+}
 
 async function renderPage() {
   const router = createRouter({
@@ -45,9 +63,18 @@ async function renderPage() {
 beforeEach(() => {
   vi.clearAllMocks()
   setActivePinia(createPinia())
+  statsFailure = null
+  statsQueue.length = 0
   apiMocks.get.mockImplementation((path: string) => {
     if (path === '/sites') return Promise.resolve({ items: [{ ...site }], page: 1, page_size: 20, total: 1 })
-    if (path === '/folders' || path === '/tags') return Promise.resolve([])
+    if (path === '/sites/stats') {
+      if (statsQueue.length) return statsQueue.shift()!
+      return statsFailure
+        ? Promise.reject(statsFailure)
+        : Promise.resolve({ total: 77, unfiled: 5, by_folder: { 'folder-guides': 42, 'folder-tools': 30 } })
+    }
+    if (path === '/folders') return Promise.resolve(folders.map((item) => ({ ...item })))
+    if (path === '/tags') return Promise.resolve([])
     if (path === '/site-types') return Promise.resolve(siteTypes.map((item) => ({ ...item })))
     throw new Error(`unexpected GET ${path}`)
   })
@@ -59,6 +86,51 @@ beforeEach(() => {
 })
 
 describe('SitesPage website types', () => {
+  it('uses unfiltered server statistics for directory counts instead of the current page', async () => {
+    const { wrapper } = await renderPage()
+    const rows = wrapper.findAll('.explorer-panel .folder-row')
+    const row = (label: string) => rows.find((item) => item.text().includes(label))
+
+    expect(row('全部网站')?.text()).toContain('77')
+    expect(row('未归档')?.text()).toContain('5')
+    expect(row('资料')?.text()).toContain('42')
+    expect(row('工具箱')?.text()).toContain('30')
+    expect(row('Sites')).toBeUndefined()
+    expect(wrapper.find('option[value="00000000-0000-0000-0000-000000000001"]').exists()).toBe(false)
+    expect(apiMocks.get).toHaveBeenCalledWith('/sites/stats')
+  })
+
+  it('keeps the website list usable and identifies a directory-statistics failure', async () => {
+    statsFailure = new Error('统计接口暂不可用')
+    const { wrapper } = await renderPage()
+
+    expect(wrapper.get('.explorer-stats-state[role="alert"]').text()).toContain('目录计数加载失败：统计接口暂不可用')
+    expect(wrapper.text()).toContain('示例站')
+    expect(wrapper.find('.error-state').exists()).toBe(false)
+    expect(wrapper.findAll('.folder-row em')).toHaveLength(0)
+  })
+
+  it('ignores an older directory-statistics failure after a newer request succeeds', async () => {
+    const { wrapper, router } = await renderPage()
+    const older = deferred<DirectoryStats>()
+    const newer = deferred<DirectoryStats>()
+    statsQueue.push(older.promise, newer.promise)
+
+    await router.replace({ query: { q: 'older' } })
+    await flushPromises()
+    await router.replace({ query: { q: 'newer' } })
+    await flushPromises()
+
+    newer.resolve({ total: 88, unfiled: 6, by_folder: { 'folder-guides': 50 } })
+    await flushPromises()
+    expect(wrapper.findAll('.folder-row')[0]?.text()).toContain('88')
+
+    older.reject(new Error('stale request failed'))
+    await flushPromises()
+    expect(wrapper.findAll('.folder-row')[0]?.text()).toContain('88')
+    expect(wrapper.find('.explorer-stats-state[role="alert"]').exists()).toBe(false)
+  })
+
   it('displays the primary type and passes the type filter to the list API', async () => {
     const { wrapper, router } = await renderPage()
 

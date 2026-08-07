@@ -1,3 +1,5 @@
+# Direct production dependencies. Runtime installation uses requirements.lock;
+# update both files together when changing these inputs.
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
 httpx==0.28.1

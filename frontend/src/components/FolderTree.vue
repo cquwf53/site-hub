@@ -14,10 +14,10 @@ function drop(event: DragEvent, folderId: string | null) {
 
 <template>
   <div class="folder-tree">
-    <button class="folder-row" :class="{ active: selected === null }" @click="$emit('select', null)" @dragover="dragOver" @drop="drop($event, null)"><span>▦</span><b>全部网站</b><em>{{ allCount }}</em></button>
-    <button class="folder-row" :class="{ active: selected === 'unfiled' }" @click="$emit('select', 'unfiled')" @dragover="dragOver" @drop="drop($event, null)"><span>□</span><b>未归档</b><em>{{ unfiledCount }}</em></button>
+    <button class="folder-row" :class="{ active: selected === null }" @click="$emit('select', null)" @dragover="dragOver" @drop="drop($event, null)"><span>▦</span><b>全部网站</b><em v-if="allCount !== undefined">{{ allCount }}</em></button>
+    <button class="folder-row" :class="{ active: selected === 'unfiled' }" @click="$emit('select', 'unfiled')" @dragover="dragOver" @drop="drop($event, null)"><span>□</span><b>未归档</b><em v-if="unfiledCount !== undefined">{{ unfiledCount }}</em></button>
     <template v-for="node in nodes" :key="node.id">
-      <button class="folder-row" :class="{ active: selected === node.id }" @click="$emit('select', node.id)" @dragover="dragOver" @drop="drop($event, node.id)"><span>▸</span><b>{{ node.name }}</b><em>{{ node.siteCount }}</em></button>
+      <button class="folder-row" :class="{ active: selected === node.id }" @click="$emit('select', node.id)" @dragover="dragOver" @drop="drop($event, node.id)"><span>▸</span><b>{{ node.name }}</b><em v-if="node.siteCount !== undefined">{{ node.siteCount }}</em></button>
       <div v-if="node.children.length" class="folder-children">
         <FolderTree :nodes="node.children" :selected="selected" @select="$emit('select', $event)" @drop-site="(siteId, folderId) => $emit('dropSite', siteId, folderId)" />
       </div>

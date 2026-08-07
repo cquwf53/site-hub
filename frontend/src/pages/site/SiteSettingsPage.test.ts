@@ -36,6 +36,7 @@ const adapterManifest = {
   id: 'test-scraper', name: 'Test scraper', version: '1.0.0', capabilities: ['product_monitor'], secret_fields: [],
   site_config_schema: { type: 'object', properties: { selector: { type: 'string', title: '商品选择器' } } },
 }
+let getFailures: Record<string, Error> = {}
 
 async function renderPage() {
   const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { template: '<div />' } }] })
@@ -51,7 +52,9 @@ async function renderPage() {
 beforeEach(() => {
   vi.clearAllMocks()
   setActivePinia(createPinia())
+  getFailures = {}
   apiMocks.get.mockImplementation((path: string) => {
+    if (getFailures[path]) return Promise.reject(getFailures[path])
     if (path === '/folders' || path === '/tags') return Promise.resolve([])
     if (path === '/adapters') return Promise.resolve([adapterManifest])
     if (path === '/site-types') return Promise.resolve([
@@ -72,6 +75,39 @@ beforeEach(() => {
 })
 
 describe('SiteSettingsPage website type', () => {
+  it('shows a scoped error when one basic-information option source fails', async () => {
+    getFailures['/folders'] = new Error('目录服务暂不可用')
+    const wrapper = await renderPage()
+    const basicSection = wrapper.get('.basic-settings-section')
+
+    expect(basicSection.get('[role="alert"]').text()).toContain('目录：目录服务暂不可用')
+    expect(basicSection.get('#settings-folder').attributes()).toHaveProperty('disabled')
+    expect(basicSection.get('#settings-site-type').attributes()).not.toHaveProperty('disabled')
+    expect(wrapper.find('.adapter-settings-section #site-adapter').exists()).toBe(true)
+    expect(wrapper.find('.product-settings-section #sync-interval').exists()).toBe(true)
+  })
+
+  it('does not disguise an adapter-catalog failure as no supported capability', async () => {
+    getFailures['/adapters'] = new Error('适配器目录暂不可用')
+    const wrapper = await renderPage()
+    const adapterSection = wrapper.get('.adapter-settings-section')
+
+    expect(adapterSection.get('[role="alert"]').text()).toContain('适配器目录暂不可用')
+    expect(adapterSection.text()).toContain('加载失败')
+    expect(wrapper.find('.product-settings-section #sync-interval').exists()).toBe(true)
+    expect(wrapper.find('#settings-name').exists()).toBe(true)
+  })
+
+  it('does not show default product settings when the product request fails', async () => {
+    getFailures['/sites/site-1/product-settings'] = new Error('商品设置读取失败')
+    const wrapper = await renderPage()
+    const productSection = wrapper.get('.product-settings-section')
+
+    expect(productSection.get('[role="alert"]').text()).toContain('商品设置读取失败')
+    expect(productSection.find('#sync-interval').exists()).toBe(false)
+    expect(wrapper.find('.adapter-settings-section #site-adapter').exists()).toBe(true)
+  })
+
   it('edits the primary type while excluding unrelated disabled types', async () => {
     const wrapper = await renderPage()
     const select = wrapper.get('#settings-site-type')

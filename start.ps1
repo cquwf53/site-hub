@@ -4,8 +4,7 @@ Set-Location -LiteralPath $PSScriptRoot
 $projectRoot = $PSScriptRoot
 $venvDir = Join-Path $projectRoot '.venv'
 $venvPython = Join-Path $venvDir 'Scripts\python.exe'
-$requirements = Join-Path $projectRoot 'requirements.txt'
-$requirementsDev = Join-Path $projectRoot 'requirements-dev.txt'
+$requirementsLock = Join-Path $projectRoot 'requirements.lock'
 $runtimeState = Join-Path $projectRoot '.runtime-state'
 $frontendIndex = Join-Path $projectRoot 'frontend\dist\index.html'
 $appUrl = 'http://127.0.0.1:8686'
@@ -140,16 +139,26 @@ if (-not (Test-Python $venvPython)) {
     $venvCreated = $true
 }
 
-$requirementsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $requirements).Hash
-$requirementsMarker = Join-Path $runtimeState 'requirements.sha256'
+$requirementsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $requirementsLock).Hash
+$requirementsMarker = Join-Path $runtimeState 'requirements-lock.sha256'
 $installedHash = if (Test-Path -LiteralPath $requirementsMarker) {
     (Get-Content -LiteralPath $requirementsMarker -Raw).Trim()
 } else { '' }
 
+if (-not $venvCreated -and $requirementsHash -eq $installedHash) {
+    & $venvPython -m pip check *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Step 'The Python environment is incomplete; reinstalling the locked dependency set.'
+        $installedHash = ''
+    }
+}
+
 if ($venvCreated -or $requirementsHash -ne $installedHash) {
     Write-Step 'Installing Python dependencies.'
-    & $venvPython -m pip install --disable-pip-version-check -r $requirements
+    & $venvPython -m pip install --disable-pip-version-check --no-deps '--only-binary=:all:' -r $requirementsLock
     if ($LASTEXITCODE -ne 0) { throw 'Python dependency installation failed.' }
+    & $venvPython -m pip check
+    if ($LASTEXITCODE -ne 0) { throw 'The locked Python dependency set is incomplete or inconsistent.' }
     Set-Content -LiteralPath $requirementsMarker -Value $requirementsHash -Encoding ascii
 }
 & $venvPython -m playwright install chromium

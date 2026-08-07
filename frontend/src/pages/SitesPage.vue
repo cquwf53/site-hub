@@ -8,12 +8,13 @@ import PaginationBar from '@/components/PaginationBar.vue'
 import FolderTree, { type FolderNode } from '@/components/FolderTree.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import { api, apiErrorMessage } from '@/api/client'
-import type { Folder, Page, Site, SiteType, Tag, TaskRef } from '@/api/types'
+import type { Folder, Page, Site, SiteDirectoryStats, SiteType, Tag, TaskRef } from '@/api/types'
 import { useAppStore } from '@/stores/app'
 import { useTaskStore } from '@/stores/tasks'
 import { formatDate, hostname } from '@/utils/format'
 import { siteTypeIcon } from '@/utils/siteType'
 
+const ROOT_FOLDER_ID = '00000000-0000-0000-0000-000000000001'
 const route = useRoute()
 const router = useRouter()
 const app = useAppStore()
@@ -24,6 +25,9 @@ const page = ref<Page<Site>>({ items: [], page: 1, page_size: 20, total: 0 })
 const folders = ref<Folder[]>([])
 const tags = ref<Tag[]>([])
 const siteTypes = ref<SiteType[]>([])
+const directoryStats = ref<SiteDirectoryStats | null>(null)
+const directoryStatsLoading = ref(true)
+const directoryStatsError = ref('')
 const createOpen = ref(false)
 const folderOpen = ref(false)
 const saving = ref(false)
@@ -34,26 +38,50 @@ const bulkTagId = ref('')
 const bulkSiteTypeId = ref('')
 const searchDraft = ref(String(route.query.q || ''))
 let searchTimer = 0
+let directoryStatsRequestId = 0
 const siteForm = ref({ name: '', url: '', folder_id: null as string | null, site_type_id: null as string | null, tag_ids: [] as string[], pinned: false, capabilities: ['bookmark'] as string[] })
 const folderForm = ref({ name: '', parent_id: null as string | null })
 
 const selectedFolder = computed(() => route.query.folder ? String(route.query.folder) : null)
 const view = computed(() => route.query.view === 'cards' ? 'cards' : 'table')
 const assignableSiteTypes = computed(() => siteTypes.value.filter((siteType) => siteType.enabled))
+const visibleFolders = computed(() => folders.value.filter((folder) => folder.id !== ROOT_FOLDER_ID))
 const folderNodes = computed<FolderNode[]>(() => {
   const map = new Map<string, FolderNode>()
-  folders.value.forEach((folder) => map.set(folder.id, { ...folder, children: [], siteCount: 0 }))
-  page.value.items.forEach((site) => { const node = site.folder_id ? map.get(site.folder_id) : undefined; if (node) node.siteCount = (node.siteCount || 0) + 1 })
+  visibleFolders.value.forEach((folder) => map.set(folder.id, {
+    ...folder,
+    children: [],
+    siteCount: directoryStats.value ? directoryStats.value.by_folder[folder.id] || 0 : undefined,
+  }))
   const roots: FolderNode[] = []
   map.forEach((node) => { const parent = node.parent_id ? map.get(node.parent_id) : undefined; if (parent) parent.children.push(node); else roots.push(node) })
   const sort = (nodes: FolderNode[]) => nodes.sort((a, b) => a.sort_order - b.sort_order).forEach((node) => sort(node.children))
   sort(roots)
   return roots
 })
-const unfiledCount = computed(() => page.value.items.filter((site) => !site.folder_id).length)
+const unfiledCount = computed(() => directoryStats.value?.unfiled)
+
+async function loadDirectoryStats() {
+  const requestId = ++directoryStatsRequestId
+  directoryStatsLoading.value = true
+  directoryStatsError.value = ''
+  try {
+    const next = await api.get<SiteDirectoryStats>('/sites/stats')
+    if (requestId !== directoryStatsRequestId) return
+    directoryStats.value = next
+    directoryStatsError.value = ''
+  } catch (value) {
+    if (requestId !== directoryStatsRequestId) return
+    directoryStats.value = null
+    directoryStatsError.value = apiErrorMessage(value)
+  } finally {
+    if (requestId === directoryStatsRequestId) directoryStatsLoading.value = false
+  }
+}
 
 async function load() {
   loading.value = true; error.value = ''
+  const statsRequest = loadDirectoryStats()
   try {
     const folder = selectedFolder.value
     ;[page.value, folders.value, tags.value, siteTypes.value] = await Promise.all([
@@ -65,7 +93,7 @@ async function load() {
     const visible = new Set(page.value.items.map((site) => site.id))
     selectedIds.value = new Set([...selectedIds.value].filter((id) => visible.has(id)))
   } catch (value) { error.value = apiErrorMessage(value) }
-  finally { loading.value = false }
+  finally { loading.value = false; await statsRequest }
 }
 
 function setQuery(values: Record<string, string | undefined>) {
@@ -195,7 +223,9 @@ onMounted(load)
   <div class="sites-layout">
     <aside class="card explorer-panel">
       <div class="explorer-header"><strong>目录</strong><button class="icon-button mini" title="新建目录" @click="folderOpen = true">＋</button></div>
-      <FolderTree :nodes="folderNodes" :selected="selectedFolder" :all-count="page.total" :unfiled-count="unfiledCount" @select="selectFolder" @drop-site="moveSite" />
+      <div v-if="directoryStatsLoading" class="explorer-stats-state" role="status">正在统计全部网站…</div>
+      <div v-else-if="directoryStatsError" class="explorer-stats-state error" role="alert"><span>目录计数加载失败：{{ directoryStatsError }}</span><button class="text-button" type="button" @click="loadDirectoryStats()">重试</button></div>
+      <FolderTree :nodes="folderNodes" :selected="selectedFolder" :all-count="directoryStats?.total" :unfiled-count="unfiledCount" @select="selectFolder" @drop-site="moveSite" />
       <div class="explorer-heading">标签</div>
       <button class="tag-filter" :class="{ active: !route.query.tag }" @click="setQuery({ tag: undefined })">全部标签</button>
       <button v-for="tag in tags" :key="tag.id" class="tag-filter" :class="{ active: route.query.tag === tag.id }" @click="setQuery({ tag: tag.id, page: undefined })"><i :style="{ background: tag.color || '#9b9da4' }" />{{ tag.name }}</button>
@@ -209,7 +239,7 @@ onMounted(load)
       </div>
       <div v-if="selectedIds.size" class="bulk-toolbar card">
         <strong>已选择 {{ selectedIds.size }} 项</strong>
-        <select v-model="bulkFolderId" aria-label="批量移动目标目录"><option value="">选择目录</option><option value="unfiled">未归档</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select>
+        <select v-model="bulkFolderId" aria-label="批量移动目标目录"><option value="">选择目录</option><option value="unfiled">未归档</option><option v-for="folder in visibleFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select>
         <button class="button secondary small" :disabled="saving || !bulkFolderId" @click="bulkMove">批量移动</button>
         <select v-model="bulkTagId" aria-label="批量添加标签"><option value="">选择标签</option><option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.name }}</option></select>
         <button class="button secondary small" :disabled="saving || !bulkTagId" @click="bulkAddTag">添加标签</button>
@@ -248,7 +278,7 @@ onMounted(load)
     <form id="site-create-form" class="form-grid" @submit.prevent="createSite">
       <div class="field span-2"><label for="site-name">名称 *</label><input id="site-name" v-model.trim="siteForm.name" required placeholder="例如：少数派" autofocus /></div>
       <div class="field span-2"><label for="site-url">网站地址 *</label><input id="site-url" v-model.trim="siteForm.url" required type="url" placeholder="https://example.com" /></div>
-      <div class="field"><label for="site-folder">目录</label><select id="site-folder" v-model="siteForm.folder_id"><option :value="null">未归档</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></div>
+      <div class="field"><label for="site-folder">目录</label><select id="site-folder" v-model="siteForm.folder_id"><option :value="null">未归档</option><option v-for="folder in visibleFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></div>
       <div class="field"><label for="site-type">主类型</label><select id="site-type" v-model="siteForm.site_type_id"><option :value="null">使用默认类型</option><option v-for="siteType in assignableSiteTypes" :key="siteType.id" :value="siteType.id">{{ siteTypeIcon(siteType.icon) }} {{ siteType.name }}</option></select></div>
       <div class="field span-2"><label>能力</label><div class="capability-picker"><button v-for="cap in [['bookmark','书签'],['product_monitor','商品'],['checkin','签到']]" :key="cap[0]" type="button" :class="{ active: siteForm.capabilities.includes(cap[0]!) }" @click="setCapability(cap[0]!)">{{ cap[1] }}</button></div></div>
       <label class="check-row span-2"><input v-model="siteForm.pinned" type="checkbox" /> 添加后置顶</label>
@@ -258,14 +288,14 @@ onMounted(load)
   <ModalDialog v-if="folderOpen" title="新建目录" :busy="saving" @close="folderOpen = false">
     <form id="folder-create-form" class="form-grid" @submit.prevent="createFolder">
       <div class="field span-2"><label for="folder-name">目录名称 *</label><input id="folder-name" v-model.trim="folderForm.name" required autofocus /></div>
-      <div class="field span-2"><label for="folder-parent">上级目录</label><select id="folder-parent" v-model="folderForm.parent_id"><option :value="null">无（顶层）</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></div>
+      <div class="field span-2"><label for="folder-parent">上级目录</label><select id="folder-parent" v-model="folderForm.parent_id"><option :value="null">无（顶层）</option><option v-for="folder in visibleFolders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></div>
     </form>
     <template #footer><button class="button secondary" @click="folderOpen = false">取消</button><button form="folder-create-form" class="button" :disabled="saving">创建</button></template>
   </ModalDialog>
 </template>
 
 <style scoped>
-.sites-layout { display: flex; align-items: flex-start; gap: 17px; }.explorer-panel { position: sticky; top: 75px; width: 210px; flex: 0 0 auto; padding: 9px; }.explorer-header { display: flex; align-items: center; justify-content: space-between; padding: 5px 6px 10px; font-size: 12px; }.icon-button.mini { width: 27px; height: 27px; font-size: 15px; }.explorer-heading { margin: 14px 7px 5px; color: var(--subtle); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }.tag-filter { display: flex; width: 100%; min-height: 32px; align-items: center; gap: 8px; padding: 0 9px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; text-align: left; }.tag-filter:hover { background: var(--surface-soft); }.tag-filter.active { color: var(--accent); background: var(--accent-soft); }.tag-filter i { width: 7px; height: 7px; border-radius: 50%; }.sites-content { min-width: 0; flex: 1; }.compact-select { width: 145px; }.view-toggle { display: flex; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; }.view-toggle button { width: 34px; height: 34px; border: 0; border-right: 1px solid var(--line); background: #fff; cursor: pointer; }.view-toggle button:last-child { border: 0; }.view-toggle button.active { color: var(--accent); background: var(--accent-soft); }.bulk-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-bottom: 10px; padding: 9px 12px; }.bulk-toolbar strong { margin-right: auto; font-size: 12px; }.bulk-toolbar select { width: 142px; min-height: 32px; }.select-cell { width: 34px; text-align: center; }.select-cell input, .card-selector input { width: 15px; min-height: 15px; }.cell-title > span:last-child { display: flex; min-width: 0; flex-direction: column; gap: 3px; }.cell-title small { color: var(--muted); font-weight: 400; }.pin-button { border: 0; color: #c5c4c0; background: transparent; cursor: pointer; font-size: 17px; }.pin-button.pinned { color: #e7a839; }.site-type-badge { display: inline-flex; min-height: 24px; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid; border-radius: 7px; font-size: 11px; font-weight: 600; white-space: nowrap; }.site-card-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 14px; }.site-card-wrap { position: relative; }.card-selector { position: absolute; z-index: 1; top: 9px; right: 9px; display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-radius: 6px; background: rgba(255,255,255,.92); color: var(--muted); font-size: 10px; }.site-card { display: flex; min-height: 155px; flex-direction: column; justify-content: space-between; padding: 16px; border: 1px solid var(--line); border-radius: 10px; }.site-card:hover { border-color: #c8cbef; box-shadow: var(--shadow); }.site-card h3 { margin: 0; }.site-card p { margin: 4px 0 0; font-size: 12px; }.card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }.capability-picker { display: flex; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 8px; }.capability-picker button { min-height: 36px; flex: 1; border: 0; border-right: 1px solid var(--line); background: #fff; cursor: pointer; }.capability-picker button:last-child { border: 0; }.capability-picker button.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }.check-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }.check-row input { width: 16px; min-height: 16px; }.visually-hidden { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.sites-layout { display: flex; align-items: flex-start; gap: 17px; }.explorer-panel { position: sticky; top: 75px; width: 210px; flex: 0 0 auto; padding: 9px; }.explorer-header { display: flex; align-items: center; justify-content: space-between; padding: 5px 6px 10px; font-size: 12px; }.explorer-stats-state { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 0 4px 7px; padding: 7px 8px; border-radius: 6px; color: var(--subtle); background: var(--surface-soft); font-size: 10px; line-height: 1.35; }.explorer-stats-state.error { color: var(--negative); background: var(--negative-soft); }.explorer-stats-state .text-button { flex: 0 0 auto; font-size: 10px; }.icon-button.mini { width: 27px; height: 27px; font-size: 15px; }.explorer-heading { margin: 14px 7px 5px; color: var(--subtle); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }.tag-filter { display: flex; width: 100%; min-height: 32px; align-items: center; gap: 8px; padding: 0 9px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; text-align: left; }.tag-filter:hover { background: var(--surface-soft); }.tag-filter.active { color: var(--accent); background: var(--accent-soft); }.tag-filter i { width: 7px; height: 7px; border-radius: 50%; }.sites-content { min-width: 0; flex: 1; }.compact-select { width: 145px; }.view-toggle { display: flex; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; }.view-toggle button { width: 34px; height: 34px; border: 0; border-right: 1px solid var(--line); background: #fff; cursor: pointer; }.view-toggle button:last-child { border: 0; }.view-toggle button.active { color: var(--accent); background: var(--accent-soft); }.bulk-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-bottom: 10px; padding: 9px 12px; }.bulk-toolbar strong { margin-right: auto; font-size: 12px; }.bulk-toolbar select { width: 142px; min-height: 32px; }.select-cell { width: 34px; text-align: center; }.select-cell input, .card-selector input { width: 15px; min-height: 15px; }.cell-title > span:last-child { display: flex; min-width: 0; flex-direction: column; gap: 3px; }.cell-title small { color: var(--muted); font-weight: 400; }.pin-button { border: 0; color: #c5c4c0; background: transparent; cursor: pointer; font-size: 17px; }.pin-button.pinned { color: #e7a839; }.site-type-badge { display: inline-flex; min-height: 24px; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid; border-radius: 7px; font-size: 11px; font-weight: 600; white-space: nowrap; }.site-card-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 14px; }.site-card-wrap { position: relative; }.card-selector { position: absolute; z-index: 1; top: 9px; right: 9px; display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-radius: 6px; background: rgba(255,255,255,.92); color: var(--muted); font-size: 10px; }.site-card { display: flex; min-height: 155px; flex-direction: column; justify-content: space-between; padding: 16px; border: 1px solid var(--line); border-radius: 10px; }.site-card:hover { border-color: #c8cbef; box-shadow: var(--shadow); }.site-card h3 { margin: 0; }.site-card p { margin: 4px 0 0; font-size: 12px; }.card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }.capability-picker { display: flex; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 8px; }.capability-picker button { min-height: 36px; flex: 1; border: 0; border-right: 1px solid var(--line); background: #fff; cursor: pointer; }.capability-picker button:last-child { border: 0; }.capability-picker button.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }.check-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }.check-row input { width: 16px; min-height: 16px; }.visually-hidden { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 @media (max-width: 980px) { .site-card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 760px) { .sites-layout { flex-direction: column; }.explorer-panel { position: static; width: 100%; }.site-card-grid { grid-template-columns: 1fr; } }
 </style>
