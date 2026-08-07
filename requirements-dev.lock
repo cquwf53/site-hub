@@ -1,0 +1,11 @@
+# Fully pinned development/test dependency set for 64-bit Windows CPython
+# 3.10-3.13. Production dependencies and their Python-version markers live in
+# requirements.lock; keep direct inputs in requirements-dev.txt.
+
+-r requirements.lock
+
+iniconfig==2.3.0
+pluggy==1.6.0
+pytest==8.3.4
+pytest-asyncio==0.24.0
+tomli==2.2.1 ; python_version == "3.10"

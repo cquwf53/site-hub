@@ -6,6 +6,7 @@ import json
 import math
 import re
 import sqlite3
+from collections.abc import Iterable
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -14,6 +15,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from site_hub.db import Database, SiteHubRepository
+from site_hub.db.job_queries import JOB_SELECT, list_job_rows
 from site_hub.notifications import NotificationOutboxStore
 from site_hub.scrapers.network import sanitize_log_value
 from site_hub.services.ports import AccountNotReady, SiteTypeConflict, StaleJobWrite
@@ -365,6 +367,30 @@ class DataLayerStore:
         total = len(rows)
         start = (page - 1) * page_size
         return rows[start:start + page_size], total
+
+    async def get_site_directory_stats(self) -> dict[str, Any]:
+        return await self._call(self._get_site_directory_stats_sync)
+
+    def _get_site_directory_stats_sync(self) -> dict[str, Any]:
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """SELECT folder_id,COUNT(*) AS site_count
+                   FROM sites
+                   WHERE status!='archived'
+                   GROUP BY folder_id"""
+            ).fetchall()
+        total = 0
+        unfiled = 0
+        by_folder: dict[str, int] = {}
+        for row in rows:
+            count = int(row["site_count"])
+            total += count
+            folder_id = row["folder_id"]
+            if folder_id is None or str(folder_id) == self.ROOT_FOLDER_ID:
+                unfiled += count
+            else:
+                by_folder[str(folder_id)] = count
+        return {"total": total, "unfiled": unfiled, "by_folder": by_folder}
 
     async def get_site(self, site_id: UUID) -> dict[str, Any] | None:
         return await self._call(self._site_row, _uuid(site_id))
@@ -1969,37 +1995,28 @@ class DataLayerStore:
 
     def _get_job_sync(self, job_id: str) -> dict[str, Any] | None:
         with self.database.connect() as conn:
-            row = conn.execute(self._job_select() + " WHERE j.id=?", (job_id,)).fetchone()
+            row = conn.execute(JOB_SELECT + " WHERE j.id=?", (job_id,)).fetchone()
             return self._normalize_job(dict(row)) if row else None
 
     async def list_jobs(self, *, page: int, page_size: int, kind: str | None = None,
-                        status: str | None = None, site_id: UUID | None = None,
+                        status: str | Iterable[str] | None = None, site_id: UUID | None = None,
                         account_id: UUID | None = None):
         return await self._call(self._list_jobs_sync, page, page_size, kind, status,
                                 _uuid(site_id) if site_id else None, _uuid(account_id) if account_id else None)
 
-    def _list_jobs_sync(self, page: int, page_size: int, kind: str | None, status: str | None,
+    def _list_jobs_sync(self, page: int, page_size: int, kind: str | None,
+                        status: str | Iterable[str] | None,
                         site_id: str | None, account_id: str | None):
-        clauses, params = [], []
-        if kind:
-            clauses.append("j.kind=?"); params.append(kind)
-        if status:
-            clauses.append("j.status=?"); params.append(status)
-        if site_id:
-            clauses.append("j.site_id=?"); params.append(site_id)
-        if account_id:
-            clauses.append("j.account_id=?"); params.append(account_id)
-        where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        with self.database.connect() as conn:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM jobs j" + where,
-                params,
-            ).fetchone()[0]
-            rows = conn.execute(
-                self._job_select() + where + " ORDER BY j.created_at DESC,j.id DESC LIMIT ? OFFSET ?",
-                [*params, page_size, (page - 1) * page_size],
-            ).fetchall()
-            return [self._normalize_job(dict(row)) for row in rows], int(total)
+        rows, total = list_job_rows(
+            self.database,
+            page=page,
+            page_size=page_size,
+            kind=kind,
+            status=status,
+            site_id=site_id,
+            account_id=account_id,
+        )
+        return [self._normalize_job(row) for row in rows], total
 
     async def lease_next_job(self, *, kind: str, worker_instance: str,
                              now: datetime, lease_expires_at: datetime) -> dict[str, Any] | None:
@@ -2030,7 +2047,7 @@ class DataLayerStore:
                 self._refresh_batch_state_locked(
                     conn, str(claimed["batch_id"]), now,
                 )
-            row = conn.execute(self._job_select() + " WHERE j.id=?", (candidate["id"],)).fetchone()
+            row = conn.execute(JOB_SELECT + " WHERE j.id=?", (candidate["id"],)).fetchone()
             return self._normalize_job(dict(row))
 
     async def mark_job_running(self, job_id: UUID, lease_token: str, now: datetime) -> dict[str, Any] | None:
@@ -2051,7 +2068,7 @@ class DataLayerStore:
                     (str(uuid4()), job_id, row["capability_instance_id"], row["account_id"],
                      row["attempt"], now, now),
                 )
-            current = conn.execute(self._job_select() + " WHERE j.id=?", (job_id,)).fetchone()
+            current = conn.execute(JOB_SELECT + " WHERE j.id=?", (job_id,)).fetchone()
             return self._normalize_job(dict(current))
 
     async def heartbeat_job(self, job_id: UUID, lease_token: str, now: datetime,
@@ -2123,7 +2140,7 @@ class DataLayerStore:
                     result=result or {}, error_kind=error_kind, now=now,
                 )
             self._refresh_batch_state_locked(conn, row["batch_id"], now)
-            current = conn.execute(self._job_select() + " WHERE j.id=?", (job_id,)).fetchone()
+            current = conn.execute(JOB_SELECT + " WHERE j.id=?", (job_id,)).fetchone()
             return self._normalize_job(dict(current))
 
     def _insert_job_result_event_locked(
@@ -2239,7 +2256,7 @@ class DataLayerStore:
                               finished_at=? WHERE job_id=? AND status='running'""", (now, job_id)
                 )
             self._refresh_batch_state_locked(conn, existing["batch_id"], now)
-            row = conn.execute(self._job_select() + " WHERE j.id=?", (job_id,)).fetchone()
+            row = conn.execute(JOB_SELECT + " WHERE j.id=?", (job_id,)).fetchone()
             return self._normalize_job(dict(row))
 
     async def retry_job(self, job_id: UUID, now: datetime) -> dict[str, Any] | None:
@@ -2262,7 +2279,7 @@ class DataLayerStore:
             self._refresh_batch_state_locked(
                 conn, existing["batch_id"] if existing else None, now,
             )
-            row = conn.execute(self._job_select() + " WHERE j.id=?", (job_id,)).fetchone()
+            row = conn.execute(JOB_SELECT + " WHERE j.id=?", (job_id,)).fetchone()
             return self._normalize_job(dict(row))
 
     async def recover_expired_jobs(self, now: datetime) -> list[dict[str, Any]]:
@@ -2308,13 +2325,8 @@ class DataLayerStore:
             for batch_id in batch_ids:
                 self._refresh_batch_state_locked(conn, batch_id, now)
             return [self._normalize_job(dict(row)) for row in conn.execute(
-                self._job_select() + (" WHERE j.id IN (%s)" % ",".join("?" for _ in ids)), ids
+                JOB_SELECT + (" WHERE j.id IN (%s)" % ",".join("?" for _ in ids)), ids
             )] if ids else []
-
-    @classmethod
-    def _job_select(cls) -> str:
-        return """SELECT j.*,c.code capability_code
-                  FROM jobs j LEFT JOIN capability_instances c ON c.id=j.capability_instance_id"""
 
     @classmethod
     def _normalize_job(cls, raw: dict[str, Any]) -> dict[str, Any]:
@@ -2491,7 +2503,7 @@ class DataLayerStore:
 
     def _list_batch_items_sync(self, batch_id: str) -> list[dict[str, Any]]:
         with self.database.connect() as conn:
-            rows = conn.execute(self._job_select() + " WHERE j.batch_id=? ORDER BY j.created_at,j.id", (batch_id,)).fetchall()
+            rows = conn.execute(JOB_SELECT + " WHERE j.batch_id=? ORDER BY j.created_at,j.id", (batch_id,)).fetchall()
             result = [self._normalize_job(dict(row)) for row in rows]
             for item in result: item["job_id"] = item["id"]
             return result

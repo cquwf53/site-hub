@@ -1,3 +1,5 @@
+# Direct development dependencies. Test installation uses
+# requirements-dev.lock, which includes the production lock.
 -r requirements.txt
 pytest==8.3.4
 pytest-asyncio==0.24.0

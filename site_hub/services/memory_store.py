@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from site_hub.db.connection import stable_uuid
+from site_hub.db.job_queries import normalize_job_statuses
 from site_hub.scrapers.network import sanitize_log_value
 from site_hub.services.ports import AccountNotReady, SiteTypeConflict
 
@@ -256,6 +257,19 @@ class MemoryStore:
         rows.sort(key=lambda r: r["id"])
         start = (page - 1) * page_size
         return [self._public_site(row) for row in rows[start:start + page_size]], len(rows)
+
+    async def get_site_directory_stats(self):
+        rows = [row for row in self.sites.values() if row.get("status") != "archived"]
+        by_folder: dict[str, int] = {}
+        unfiled = 0
+        for row in rows:
+            folder_id = row.get("folder_id")
+            if folder_id is None or UUID(str(folder_id)) == self.ROOT_FOLDER_ID:
+                unfiled += 1
+            else:
+                key = str(folder_id)
+                by_folder[key] = by_folder.get(key, 0) + 1
+        return {"total": len(rows), "unfiled": unfiled, "by_folder": by_folder}
 
     async def get_site(self, site_id):
         row=self.sites.get(UUID(str(site_id)))
@@ -881,7 +895,8 @@ class MemoryStore:
     async def list_jobs(self, *, page, page_size, kind=None, status=None, site_id=None, account_id=None):
         rows = list(self.jobs.values())
         if kind: rows = [r for r in rows if r["kind"] == kind]
-        if status: rows = [r for r in rows if r["status"] == status]
+        statuses = set(normalize_job_statuses(status))
+        if statuses: rows = [r for r in rows if r["status"] in statuses]
         if site_id is not None: rows = [r for r in rows if r.get("site_id") == site_id]
         if account_id is not None: rows = [r for r in rows if r.get("account_id") == account_id]
         rows.sort(key=lambda r: r["created_at"], reverse=True); start=(page-1)*page_size

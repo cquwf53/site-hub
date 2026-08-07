@@ -7,6 +7,12 @@ export interface Page<T> {
   total: number
 }
 
+export interface SiteDirectoryStats {
+  total: number
+  unfiled: number
+  by_folder: Record<string, number>
+}
+
 export interface TaskRef {
   jobId: string
   status: TaskStatus

@@ -2,12 +2,39 @@
 
 以下命令均在 SiteHub 项目根目录运行。自动化测试通过是发布门槛之一，不等于真实账号登录、Profile 或正式切换已经验收。
 
-## Python 测试
+## Windows 统一验收（推荐）
 
-`start.bat` 安装运行依赖；测试前还需安装开发依赖：
+端口 `8686` 空闲时，默认命令会依次安装锁定依赖、运行 Python/Node/Vue 测试、Vue 类型检查、生产构建，并调用 Windows smoke 完成隔离启动、健康检查、Worker 恢复和进程清理：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify.ps1
+```
+
+所有测试进程都会收到系统临时目录下的独立 `SITEHUB_DATA_DIR`；脚本不会把项目的正式 `data/` 用作测试数据。若 `8686` 已被 SiteHub 或其他程序占用，脚本会在运行门槛前明确失败并报告 PID。需要在服务在线时先运行其余门槛，可显式跳过启动 smoke：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify.ps1 `
+  -SkipDependencyInstall -SkipSmoke
+```
+
+`-SkipDependencyInstall` 只适用于 `.venv`、Node workspace 和浏览器运行时已经准备完整的情况；任何原生命令非零退出都会使统一脚本立即失败。
+
+## Python 依赖锁
+
+- `requirements.txt`、`requirements-dev.txt` 只保存生产/开发直接依赖输入；
+- `requirements.lock` 锁定生产直接及传递依赖，`start.ps1` 和生产 smoke 只从该文件安装；
+- `requirements-dev.lock` 包含生产锁及测试传递依赖，供统一验收和本地测试安装；
+- 安装使用 `--no-deps --only-binary=:all:`，随后执行 `pip check`，避免安装时重新解析未锁定的传递版本。
+
+锁文件面向 64 位 Windows CPython 3.10–3.13。`numpy` 在 3.10、3.11、3.12+ 有不同的可用版本，`onnxruntime` 和 `websockets` 也需要 3.10/3.11+ 分支，因此生产锁用 `python_version` marker 保存逐版本 Windows wheel 解析结果；不能用任意单个 `.venv` 的裸 `pip freeze` 覆盖它。修改直接依赖时，必须分别重新解析 3.10、3.11、3.12、3.13，更新两个锁文件，并运行统一验收。
+
+## Python 测试
+
+`start.bat` 从生产锁安装运行依赖；单独运行测试前还需安装开发锁：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --no-deps --only-binary=:all: -r requirements-dev.lock
+.\.venv\Scripts\python.exe -m pip check
 .\.venv\Scripts\python.exe -m pytest -q -m "not integration and not profile"
 ```
 

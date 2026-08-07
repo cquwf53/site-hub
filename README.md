@@ -18,7 +18,7 @@ SQLite 的业务写入只由 Python 控制面完成；Node Worker 通过标准�
 start.bat
 ```
 
-启动脚本会按需创建 `.venv`、安装 Python/Node 依赖及 Playwright Chromium、构建 `frontend/dist`，随后启动 SiteHub，并在完整就绪后打开浏览器。再次启动同一数据目录会被单实例锁拒绝。
+启动脚本会按需创建 `.venv`、从 `requirements.lock` 安装已锁定的 Python 生产依赖、安装 Node 依赖及 Playwright Chromium、构建 `frontend/dist`，随后启动 SiteHub，并在完整就绪后打开浏览器。再次启动同一数据目录会被单实例锁拒绝。直接依赖输入与生产/开发锁的维护规则，以及隔离数据的一键 Windows 验收命令，见 [测试说明](docs/testing.md)。
 
 日常数据默认位于 `data/`：
 

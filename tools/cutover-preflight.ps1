@@ -496,9 +496,10 @@ if ($profileInventoryAvailable) {
 }
 
 foreach ($required in @(
-    'start.bat', 'start.ps1', 'requirements.txt', 'package.json', 'package-lock.json',
+    'start.bat', 'start.ps1', 'requirements.txt', 'requirements.lock',
+    'requirements-dev.txt', 'requirements-dev.lock', 'package.json', 'package-lock.json',
     'frontend\dist\index.html', 'worker-node\src\main.js',
-    'tools\migrate_legacy.py', 'tools\smoke-windows.ps1',
+    'tools\migrate_legacy.py', 'tools\smoke-windows.ps1', 'tools\verify.ps1',
     'tools\preflight_probe.py', 'tools\smoke-launcher.ps1',
     'tools\install-startup.ps1', 'tools\uninstall-startup.ps1',
     'tools\stop-sitehub.ps1', 'tools\startup-task-common.ps1',

@@ -348,9 +348,9 @@ function Initialize-VerifiedSetup {
     # still runs from its first line and still acquires both mutexes.
     $runtimeState = Join-Path $projectRoot '.runtime-state'
     New-Item -ItemType Directory -Path $runtimeState -Force | Out-Null
-    $requirementsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $projectRoot 'requirements.txt')).Hash
+    $requirementsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $projectRoot 'requirements.lock')).Hash
     $packageHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $projectRoot 'package-lock.json')).Hash
-    Set-Content -LiteralPath (Join-Path $runtimeState 'requirements.sha256') -Value $requirementsHash -Encoding ascii
+    Set-Content -LiteralPath (Join-Path $runtimeState 'requirements-lock.sha256') -Value $requirementsHash -Encoding ascii
     Set-Content -LiteralPath (Join-Path $runtimeState 'package.sha256') -Value $packageHash -Encoding ascii
     $env:SITEHUB_SKIP_BUILD = '1'
 }
@@ -373,10 +373,10 @@ function Invoke-StaleVenvRecovery {
     New-Item -ItemType Directory -Path $fixtureData -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $projectRoot 'start.ps1') -Destination (Join-Path $fixtureRoot 'start.ps1')
     Copy-Item -LiteralPath (Join-Path $projectRoot 'start.bat') -Destination (Join-Path $fixtureRoot 'start.bat')
-    # An empty requirements file makes the fixture deterministic and offline.
+    # An empty lock file makes the fixture deterministic and offline.
     # It intentionally fails later at the absent Playwright module, after the
     # stale environment has been replaced and before any Node setup is reached.
-    Set-Content -LiteralPath (Join-Path $fixtureRoot 'requirements.txt') -Value '' -Encoding ascii
+    Set-Content -LiteralPath (Join-Path $fixtureRoot 'requirements.lock') -Value '' -Encoding ascii
     Set-Content -LiteralPath $sentinel -Value 'invalid virtual environment' -Encoding ascii
     Assert-True ($fixtureRoot.Contains(' ')) 'The stale-.venv fixture path must contain spaces.'
 
@@ -450,9 +450,10 @@ function Invoke-StaleVenvRecovery {
 function Get-SetupFingerprint {
     $relativeFiles = @(
         'requirements.txt',
+        'requirements.lock',
         'package.json',
         'package-lock.json',
-        '.runtime-state\requirements.sha256',
+        '.runtime-state\requirements-lock.sha256',
         '.runtime-state\package.sha256',
         '.venv\pyvenv.cfg',
         'node_modules\.package-lock.json',
@@ -485,7 +486,7 @@ function Test-IsSetupPath([string]$FullPath) {
         $prefix = [System.IO.Path]::GetFullPath($directory).TrimEnd('\') + '\'
         if ($full.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
-    foreach ($file in @('package.json', 'package-lock.json', 'requirements.txt')) {
+    foreach ($file in @('package.json', 'package-lock.json', 'requirements.txt', 'requirements.lock')) {
         if ($full.Equals((Join-Path $projectRoot $file), [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
     return $false

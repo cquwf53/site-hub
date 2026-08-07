@@ -12,12 +12,13 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, Response
 
-from site_hub.jobs.service import JobConflict, JobNotFound, JobService
+from site_hub.api.job_routes import router as job_router
+from site_hub.jobs.service import JobConflict, JobService
 from site_hub.models import (
     BackupCreateRequest, BackupRestoreRequest,
-    CheckinAccountCreate, CheckinAccountUpdate, JobKind, JobStatus,
+    CheckinAccountCreate, CheckinAccountUpdate,
     ProductCategoryAssignment, ProductCategoryCreate, ProductCategoryUpdate,
     ProductSettingsUpdate, ScheduleSettingsUpdate, SiteCreate, SiteTypeBulkAssignment,
     SiteTypeCreate, SiteTypeUpdate, SiteUpdate,
@@ -29,6 +30,7 @@ from site_hub.services.ports import SiteTypeConflict
 
 
 router = APIRouter(prefix="/api/v1")
+router.include_router(job_router)
 logger = logging.getLogger(__name__)
 
 
@@ -233,6 +235,11 @@ async def list_sites(request: Request, page: int = Query(1, ge=1),
                                                     folder_id=folder_id, tag_id=tag_id,
                                                     site_type_id=site_type_id)
     return _page(items, page, page_size, total)
+
+
+@router.get("/sites/stats")
+async def site_directory_stats(request: Request):
+    return await _store(request).get_site_directory_stats()
 
 
 @router.post("/sites", status_code=201)
@@ -540,57 +547,6 @@ async def delete_product_category(request: Request, category_id: UUID):
     if not await _store(request).delete_product_category(category_id):
         _not_found("Product category not found")
     return Response(status_code=204)
-
-
-# -- Durable tasks ------------------------------------------------------
-@router.get("/jobs")
-async def list_jobs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=200),
-                    kind: JobKind | None = None, status: list[JobStatus] | None = Query(None),
-                    site_id: UUID | None = None, account_id: UUID | None = None):
-    one_status = status[0].value if status and len(status) == 1 else None
-    if status and len(status) > 1:
-        rows, _ = await _store(request).list_jobs(
-            page=1, page_size=200, kind=kind.value if kind else None, status=None,
-            site_id=site_id, account_id=account_id,
-        )
-        rows = [row for row in rows if row.get("status") in {value.value for value in status}]
-        total = len(rows); start = (page - 1) * page_size; rows = rows[start:start + page_size]
-    else:
-        rows, total = await _store(request).list_jobs(
-            page=page, page_size=page_size, kind=kind.value if kind else None,
-            status=one_status, site_id=site_id, account_id=account_id,
-        )
-    return _page([_jobs(request).public_job(row) for row in rows], page, page_size, total)
-
-
-@router.get("/jobs/{job_id}")
-async def get_job(request: Request, job_id: UUID):
-    row = await _store(request).get_job(job_id)
-    if not row: _not_found("Job not found")
-    return _jobs(request).public_job(row)
-
-
-@router.post("/jobs/{job_id}/cancel")
-async def cancel_job(request: Request, job_id: UUID):
-    row = await _jobs(request).cancel(job_id)
-    await request.app.state.dispatcher.cancel_execution(job_id)
-    with __import__("contextlib").suppress(Exception):
-        await request.app.state.supervisor.cancel_job(job_id)
-    await request.app.state.system_dispatcher.cancel_execution(job_id)
-    return _jobs(request).public_job(row)
-
-
-@router.post("/jobs/{job_id}/retry")
-async def retry_job(request: Request, job_id: UUID):
-    row = await _jobs(request).retry(job_id)
-    return _task_json(_jobs(request).task_ref(row))
-
-
-@router.get("/stream")
-@router.get("/tasks/stream", include_in_schema=False)
-async def task_stream(request: Request):
-    return StreamingResponse(request.app.state.events.stream(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # -- Scheduling and worker ---------------------------------------------
