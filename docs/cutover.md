@@ -47,6 +47,7 @@ $migrate = 'E:\myprojects\site-hub\tools\migrate_legacy.py'
 $vshopDb = 'C:\Users\31587\.gemini\antigravity\scratch\vshop_monitor\data\vshop.db'
 $checkinDb = 'E:\myprojects\auto-checkin-hub\data\checkin.db'
 $profiles = 'E:\myprojects\auto-checkin-hub\data\browser-profiles'
+$artifacts = 'E:\myprojects\auto-checkin-hub\data\screenshots'
 $targetDb = 'E:\myprojects\site-hub\data\site-hub.db'
 $receipt = 'E:\myprojects\site-hub\.runtime-state\cutover-receipt.json'
 
@@ -90,10 +91,12 @@ Get-ScheduledTask -TaskName 'AutoCheckin Hub' | Format-List TaskName,State
   --vshop-db $vshopDb --autocheckin-db $checkinDb --target-db $targetDb `
   --preflight-receipt $receipt `
   --copy-profiles --profile-source $profiles `
-  --profile-target 'E:\myprojects\site-hub\data\browser-profiles'
+  --profile-target 'E:\myprojects\site-hub\data\browser-profiles' `
+  --copy-artifacts --artifact-source $artifacts `
+  --artifact-target 'E:\myprojects\site-hub\data\artifacts'
 ```
 
-迁移器在首次创建目标前验证收据，并在业务导入后再次验证源路径、SHA-256 和 WAL 冻结状态。初始化或业务导入失败时，只删除本次独占创建的目标 DB/WAL/SHM，因此可在收据有效期内安全重试。Profile 阶段中断时，成功导入的数据库与收据绑定会保留；修复 Profile 源后使用 `--profiles-only` 恢复，禁止重复导入业务数据。恢复阶段不再接收短时效收据，而是从目标数据库读取已持久化绑定，并重新核对源库哈希及 Profile 源/目标路径。
+迁移器在首次创建目标前验证收据，并在业务导入后再次验证源路径、SHA-256 和 WAL 冻结状态。初始化或业务导入失败时，只删除本次独占创建的目标 DB/WAL/SHM，因此可在收据有效期内安全重试。Profile 或截图复制阶段中断时，成功导入的数据库与收据绑定会保留；确认冻结源与收据哈希仍一致后，Profile 使用 `--copy-profiles --profiles-only`、截图使用 `--copy-artifacts --artifacts-only` 恢复，禁止重复导入业务数据。恢复阶段不再接收短时效收据，而是从目标数据库读取已持久化绑定，并重新核对源库哈希及 Profile 源/目标路径。
 
 ## 5. 切换验收
 
@@ -101,7 +104,7 @@ Get-ScheduledTask -TaskName 'AutoCheckin Hub' | Format-List TaskName,State
 
 1. 校验迁移报告、数据库完整性、外键、Legacy 映射和计数。
 2. 扫描目标数据库，确认敏感 URL 查询参数、Cookie、Token、Authorization 和 Webhook 无明文。
-3. 启动 SiteHub，核对目录、标签、网站、商品、历史、批次、账号和事件。
+3. 启动 SiteHub，核对目录、标签、网站、商品、历史、批次、账号和事件；打开至少一张旧签到截图，确认复制后的文件、大小及 SHA-256 校验正常。
 4. 逐账号验证复制的 Profile。初始 `unverified` 属正常状态；验证失败的账号必须保持禁用并重新登录。
 5. 执行一次商品同步和受控签到 E2E；确认唯一长期业务监听是 `127.0.0.1:8686`、CDP 任务的随机端口仅绑定回环且任务后释放、第二实例被拒绝、Worker 可恢复、停止后无子进程残留。
 

@@ -40,6 +40,27 @@ export function isJianzhileSite(site) {
   }
 }
 
+export async function jianzhileCheckAlreadyDone(site, { chromium } = {}) {
+  let context;
+  try {
+    context = await launchSiteContext(site, true, chromium);
+    const page = context.pages()[0] || await context.newPage();
+    await page.goto(new URL('/console/personal', site.url).href, {
+      waitUntil: 'domcontentloaded', timeout: 30000,
+    });
+    const userId = await readNewApiUserId(page);
+    if (!userId) return { done: false, conclusive: false, message: '请先重新登录并验证账号' };
+    const payload = await fetchCheckinStatus(page, userId);
+    const done = payload?.data?.stats?.checked_in_today;
+    if (payload?.success !== true || typeof done !== 'boolean') {
+      return { done: false, conclusive: false, message: '签到状态接口未返回明确的今日状态' };
+    }
+    return { done, conclusive: true };
+  } finally {
+    if (context) await closeTrackedResource(context).catch(() => {});
+  }
+}
+
 export async function jianzhileCheckin(site) {
   const startTime = Date.now();
   const config = site.config || {};
@@ -192,8 +213,8 @@ export async function jianzhileCheckin(site) {
   }
 }
 
-async function launchSiteContext(site, headless) {
-  const { chromium } = await import('playwright');
+async function launchSiteContext(site, headless, injectedChromium) {
+  const chromium = injectedChromium || (await import('playwright')).chromium;
   return trackCloseable(await chromium.launchPersistentContext(getProfileDir(site.id), {
     channel: 'chrome',
     headless,
@@ -208,6 +229,7 @@ async function openPersonalPage(context, site) {
   page.setDefaultTimeout(30000);
   const personalUrl = new URL('/console/personal', site.url).href;
   const statusResponsePromise = waitForCheckinGet(page, 20000);
+  site.markRemoteEffect?.();
   await page.goto(personalUrl, {
     waitUntil: 'domcontentloaded',
     timeout: 30000,
@@ -304,6 +326,7 @@ async function fetchCheckinStatus(page, userId) {
         credentials: 'include',
         headers: { 'New-Api-User': newApiUser },
       });
+      if (!response.ok) return { success: false, message: '签到状态接口请求失败' };
       return await response.json();
     } catch (error) {
       return { success: false, message: error.message };

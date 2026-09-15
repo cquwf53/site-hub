@@ -31,6 +31,7 @@ export async function btschoolCheckin(site) {
       void dialog.accept().catch(() => {});
     });
 
+    site.markRemoteEffect?.();
     await page.goto(site.url, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,
@@ -88,6 +89,7 @@ export async function btschoolCheckin(site) {
     const explicitSuccess = /签到成功|成功签到|获得.{0,60}(?:魔力|奖励)|(?:魔力|奖励).{0,60}(?:增加|获得)/i
       .test(combinedMessage);
 
+    site.markRemoteEffect?.();
     await page.goto(site.url, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,

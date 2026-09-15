@@ -15,13 +15,15 @@ const store = useTaskStore()
     <Transition name="drawer">
       <aside v-if="app.taskDrawerOpen" class="task-drawer" aria-label="后台任务">
         <div class="drawer-header">
-          <div><h2>后台任务</h2><p>{{ store.streamConnected ? '实时更新已连接' : '轮询更新' }}</p></div>
+          <div><h2>后台任务</h2><p>{{ store.streamConnected ? '实时更新 · 定期核对' : '实时连接未就绪，正在轮询核对' }}</p></div>
           <button class="icon-button" aria-label="关闭" @click="app.taskDrawerOpen = false">×</button>
         </div>
         <div v-if="!store.tasks.length" class="empty-compact">暂无后台任务</div>
         <div v-else class="task-list">
           <article v-for="task in store.tasks" :key="task.id" class="task-item">
             <div class="row-between"><strong>{{ task.title }}</strong><StatusBadge :status="task.status" /></div>
+            <p v-if="task.syncError" role="alert">状态暂无法确认：{{ task.syncError }} <button class="text-button" @click="store.refreshTask(task.id)">重新核对</button></p>
+            <p v-if="task.result?.catalog_anomaly" role="alert">抓取目录数量异常，已保留原商品。请检查网站抓取配置后重新同步。</p>
             <p v-if="task.message">{{ task.message }}</p>
             <div v-if="task.progress !== null" class="progress-track"><span :style="{ width: `${Math.max(0, Math.min(100, task.progress))}%` }" /></div>
             <div class="task-meta"><span>{{ task.kind }}</span><button class="text-button subtle" @click="store.dismiss(task.id)">移除</button></div>

@@ -15,6 +15,8 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 
 from site_hub.api.job_routes import router as job_router
+from site_hub.api.monitoring_routes import router as monitoring_router
+from site_hub.api.maintenance_routes import router as maintenance_router
 from site_hub.jobs.service import JobConflict, JobService
 from site_hub.models import (
     BackupCreateRequest, BackupRestoreRequest,
@@ -31,6 +33,8 @@ from site_hub.services.ports import SiteTypeConflict
 
 router = APIRouter(prefix="/api/v1")
 router.include_router(job_router)
+router.include_router(monitoring_router)
+router.include_router(maintenance_router)
 logger = logging.getLogger(__name__)
 
 
@@ -425,11 +429,12 @@ async def list_products(request: Request, page: int = Query(1, ge=1),
                         availability_status: Literal[
                             "available", "sold_out", "missing", "delisted", "unknown"
                         ] | None = None,
-                        category_id: UUID | None = None):
+                        category_id: UUID | None = None, watched: bool | None = None):
     method = getattr(_store(request), "list_products", None)
     if not method: return _page([], page, page_size, 0)
     items, total = await method(page=page, page_size=page_size, site_id=site_id, q=q,
-                                availability_status=availability_status, category_id=category_id)
+                                availability_status=availability_status, category_id=category_id,
+                                **({"watched": watched} if watched is not None else {}))
     return _page(items, page, page_size, total)
 
 

@@ -38,6 +38,7 @@ export async function nodeLocCheckin(site) {
 
     const page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(30000);
+    site.markRemoteEffect?.();
     await page.goto(new URL('/', site.url).href, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,

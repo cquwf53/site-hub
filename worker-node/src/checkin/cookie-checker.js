@@ -55,6 +55,7 @@ export async function cookieCheckin(site) {
   const startTime = Date.now();
 
   try {
+    site.markRemoteEffect?.();
     // If CSRF token is needed, fetch main page first
     if (config.csrfSelector) {
       const { text: pageText } = await fetchTextWithLimits(site.url, {

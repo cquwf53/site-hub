@@ -203,14 +203,24 @@ class NodeWorkerSupervisor:
     async def stop(self)->None:
         self._stop.set(); self._ready.clear()
         if self._peer and self.state=="ready":
-            with suppress(Exception): await self._peer.request("worker.shutdown",{"graceMs":self.shutdown_seconds*1000},timeout=self.shutdown_seconds)
-        if self._dispatch:
-            self._dispatch.cancel()
-            with suppress(asyncio.CancelledError): await self._dispatch
-        await self._terminate_process()
+            with suppress(Exception):
+                await self._peer.request(
+                    "worker.shutdown",{"graceMs":self.shutdown_seconds*1000},
+                    timeout=self.shutdown_seconds,
+                )
         if self._manager:
-            self._manager.cancel()
-            with suppress(asyncio.CancelledError): await self._manager
+            if self._process:
+                # The manager owns process and pipe cleanup. Do not race a second
+                # terminator against it or kill Node before its completion ACK.
+                with suppress(Exception):
+                    await asyncio.wait_for(asyncio.shield(self._manager),self.shutdown_seconds)
+            if not self._manager.done(): self._manager.cancel()
+            with suppress(asyncio.CancelledError,Exception): await self._manager
+        else:
+            if self._dispatch:
+                self._dispatch.cancel()
+                with suppress(asyncio.CancelledError,Exception): await self._dispatch
+            await self._terminate_process()
         self.state="stopped"
 
     async def restart(self)->None:
@@ -268,6 +278,7 @@ class NodeWorkerSupervisor:
         self.state="starting"; self._ready.clear(); self.instance_id=str(uuid4())
         self._process=await asyncio.create_subprocess_exec(self.executable,str(self.entry),
             stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,
+            limit=1024*1024,
             cwd=str(self.entry.parent.parent),env={**os.environ,"SITEHUB_WORKER":"1",
                 "SITEHUB_DATA_DIR":str(self.profiles_dir.parent),"SITEHUB_PROFILE_DIR":str(self.profiles_dir),
                 "SITEHUB_ARTIFACT_DIR":str(self.artifacts_dir),"SITEHUB_PYTHON":sys.executable})
@@ -289,38 +300,65 @@ class NodeWorkerSupervisor:
         self._peer.on("session.event",self._on_session_event); self._peer.start()
         self._stderr=asyncio.create_task(self._drain_stderr(self._process.stderr))
         ping:asyncio.Task[None]|None=None
+        root_exit:asyncio.Task[None]|None=None
+        disconnected:asyncio.Task[bool]|None=None
         try:
             await asyncio.wait_for(self._ready.wait(),self.handshake_seconds)
             self.state="ready"; self.last_error=None
             self._dispatch=asyncio.create_task(self._dispatch_loop(),name="node-checkin-dispatch")
             ping=asyncio.create_task(self._ping_loop(),name="node-worker-ping")
+            process = self._process
             process_job = self._process_job
-            if process_job:
-                await asyncio.to_thread(process_job.wait_for_root)
-                # Closing the kill-on-close job at root exit removes any browser/helper
-                # descendants before asyncio waits for inherited stdout/stderr handles.
-                self._close_process_job()
-            await self._process.wait()
+            async def wait_for_exit():
+                if process_job:
+                    await asyncio.to_thread(process_job.wait_for_root)
+                    self._close_process_job()
+                await process.wait()
+            root_exit=asyncio.create_task(wait_for_exit(),name="node-worker-exit")
+            disconnected=asyncio.create_task(self._peer.closed.wait(),name="node-worker-disconnect")
+            done,_=await asyncio.wait(
+                {root_exit,disconnected,ping,self._dispatch},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if self._stop.is_set():
+                await root_exit
+                return
+            if root_exit not in done:
+                failure=next((task.exception() for task in (ping,self._dispatch)
+                              if task in done and not task.cancelled()),None)
+                await self._terminate_process()
+                if self._active_job and self._active_lease_token:
+                    with suppress(StaleLease):
+                        await self.jobs.complete(
+                            self._active_job,self._active_lease_token,
+                            status=JobStatus.EFFECT_UNKNOWN,error_kind="worker_lost",
+                            error_message="worker stopped responding; verify the remote result before retrying",
+                        )
+                raise RuntimeError(f"Node worker health check failed: {failure or 'RPC disconnected'}")
+            await root_exit
             if self._active_job and self._active_lease_token:
                 with suppress(StaleLease):
                     await self.jobs.complete(self._active_job,self._active_lease_token,
                         status=JobStatus.EFFECT_UNKNOWN,error_kind="worker_lost",
                         error_message="check-in worker exited while the outcome was unknown")
-            raise RuntimeError(f"Node worker exited with code {self._process.returncode}")
+            raise RuntimeError(f"Node worker exited with code {process.returncode}")
         finally:
             self._ready.clear(); self.pid=None; self._active_job=None; self._active_lease_token=None
-            if ping:
-                ping.cancel()
-                with suppress(asyncio.CancelledError): await ping
+            for monitor in (ping,root_exit,disconnected):
+                if monitor:
+                    monitor.cancel()
+                    with suppress(asyncio.CancelledError,Exception): await monitor
             if self._dispatch:
                 self._dispatch.cancel()
-                with suppress(asyncio.CancelledError): await self._dispatch
+                with suppress(asyncio.CancelledError,Exception): await self._dispatch
                 self._dispatch=None
+            await self._terminate_process()
             self._close_process_job()
-            if self._peer: await self._peer.close()
+            if self._peer:
+                with suppress(Exception): await self._peer.close()
             if self._stderr:
                 self._stderr.cancel();
-                with suppress(asyncio.CancelledError): await self._stderr
+                with suppress(asyncio.CancelledError,Exception): await self._stderr
 
     async def _on_hello(self,params:dict[str,Any])->dict[str,Any]:
         if int(params.get("protocol",0))!=1: raise JsonRpcError(-32001,"unsupported protocol")
@@ -388,6 +426,7 @@ class NodeWorkerSupervisor:
             if not job: await asyncio.sleep(.5); continue
             self._active_job=UUID(str(job["id"])); token=str(job["lease_token"])
             self._active_lease_token=token
+            start_requested=False
             try:
                 await self.jobs.mark_running(UUID(str(job["id"])),token)
                 account=await self.jobs.store.get_account(UUID(str(job["account_id"])))
@@ -415,7 +454,10 @@ class NodeWorkerSupervisor:
                     "account":{"id":account["id"],"name":account["name"],"adapter":account["adapter"]},
                     "checkinConfig":account.get("runtime_config") or account.get("config") or {},
                     "profileDir":str(self._profile_path(str(account["profile_key"]))),
-                    "reconcile":int(job.get("attempt") or 1)>1}
+                    "reconcile":int(job.get("attempt") or 1)>1 and (
+                        (job.get("payload") or {}).get("retry_context",{}).get("remote_effect")!="not_started"
+                    )}
+                start_requested=self._peer is not None
                 response=await self._peer.request("job.start",params,timeout=10) if self._peer else None
                 if not response or not response.get("accepted"): raise RuntimeError("worker rejected job")
             except StaleLease:
@@ -424,7 +466,20 @@ class NodeWorkerSupervisor:
             except Exception as exc:
                 self._cancel_requested_jobs.discard(UUID(str(job["id"])))
                 self._active_job=None; self._active_lease_token=None
-                with suppress(StaleLease): await self.jobs.complete(UUID(str(job["id"])),token,status=JobStatus.FAILED,error_kind="infrastructure",error_message=self._redact(str(exc))[:500])
+                with suppress(StaleLease):
+                    await self.jobs.complete(
+                        UUID(str(job["id"])),token,
+                        status=JobStatus.EFFECT_UNKNOWN if start_requested else JobStatus.FAILED,
+                        error_kind="dispatch_unknown" if start_requested else "infrastructure",
+                        error_message=self._redact(str(exc))[:500],
+                        result={"metadata":{"remoteEffect":"possible" if start_requested else "not_started",
+                                "nextAction":"先确认站点签到状态，再重试" if start_requested else "修复配置或环境后可安全重试"}},
+                    )
+                if start_requested:
+                    # An ACK timeout does not cancel execution inside Node.
+                    # Recycle before dispatching another task into that worker.
+                    await self._terminate_process()
+                    return
 
     async def _ping_loop(self)->None:
         while self._ready.is_set():
@@ -492,6 +547,13 @@ class NodeWorkerSupervisor:
         finally:
             if process_job:
                 process_job.close()
+            if process:
+                # asyncio.Process has no public close operation. On Windows an
+                # exited root can still own Proactor pipe transports after
+                # descendants are killed; close the owned transport explicitly.
+                transport=getattr(process,"_transport",None)
+                if transport: transport.close()
+                await asyncio.sleep(0)
 
     def _close_process_job(self)->None:
         process_job=self._process_job; self._process_job=None

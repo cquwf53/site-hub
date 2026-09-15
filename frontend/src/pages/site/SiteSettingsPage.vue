@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import AsyncState from '@/components/AsyncState.vue'
 import DynamicSchemaForm from '@/components/DynamicSchemaForm.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
+import MonitorPolicyForm from '@/components/MonitorPolicyForm.vue'
 import { api, apiErrorMessage } from '@/api/client'
 import type { AdapterManifest, Folder, Site, SiteType, Tag } from '@/api/types'
 import { useAppStore } from '@/stores/app'
@@ -120,6 +121,7 @@ onMounted(load)
         <form class="card-body form-grid" @submit.prevent="saveProduct"><div class="switch-row span-2"><div><div class="field-label">启用商品追踪</div><p class="field-help">启用后由 Python 抓取器进入统一持久化队列。</p></div><button type="button" class="switch" :class="{ on: product.enabled }" :aria-pressed="product.enabled" @click="product.enabled = !product.enabled" /></div><div class="field"><label for="sync-interval">站点覆盖周期（分钟）</label><input id="sync-interval" v-model.number="product.interval_override_minutes" type="number" min="1" max="10080" placeholder="留空使用全局 60 分钟" /><p class="field-help">留空时使用全局周期；当前有效值 {{ product.effective_interval_minutes || 60 }} 分钟。</p></div><div /><div class="form-actions span-2"><button class="button" :disabled="saving === 'product'">保存商品设置</button></div></form>
       </AsyncState>
     </section>
+    <MonitorPolicyForm v-if="site" :site-id="site.id" />
     <section class="card danger-zone"><div><h2>删除网站</h2><p>删除网站、账号与当前配置；历史事件仍可在数据归档中保留。</p></div><button class="button secondary" @click="deleteOpen = true">删除网站</button></section>
   </div>
   <ModalDialog v-if="deleteOpen" title="确认删除网站" :busy="saving === 'delete'" @close="deleteOpen = false"><p>此操作无法撤销。确认删除“{{ site?.name }}”吗？</p><template #footer><button class="button secondary" @click="deleteOpen = false">取消</button><button class="button danger" :disabled="saving === 'delete'" @click="remove">确认删除</button></template></ModalDialog>

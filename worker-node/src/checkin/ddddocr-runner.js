@@ -50,7 +50,7 @@ class DdddocrRunner {
       let proc;
       try {
         proc = trackChildProcess(
-          spawn(PYTHON, [PY_SCRIPT], { stdio: ['pipe', 'pipe', 'pipe'] }),
+          spawn(PYTHON, [PY_SCRIPT], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }),
           'ddddocr',
         );
       } catch {

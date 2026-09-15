@@ -54,7 +54,7 @@ function Test-Python([string]$pythonPath) {
         if ($pythonPath -match '[\\/]' -and -not (Test-Path -LiteralPath $pythonPath)) {
             return $false
         }
-        & $pythonPath -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)" *> $null
+        & $pythonPath -c "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)" *> $null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -73,7 +73,7 @@ function Resolve-Python {
 
     foreach ($candidate in $candidates) {
         try {
-            $probeArgs = @($candidate.Args) + @('-c', "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)")
+            $probeArgs = @($candidate.Args) + @('-c', "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)")
             & $candidate.File @probeArgs *> $null
             if ($LASTEXITCODE -eq 0) {
                 return $candidate
@@ -116,7 +116,7 @@ if (-not (Test-Python $venvPython)) {
     Write-Step 'Creating an isolated Python environment.'
     $python = Resolve-Python
     if ($null -eq $python) {
-        throw 'Python 3.10-3.13 is required. Install Python 3.12 and run start.bat again.'
+        throw 'Python 3.11-3.13 is required. Install Python 3.12 and run start.bat again.'
     }
     if (Test-Path -LiteralPath $venvDir) {
         $trimSeparators = [char[]]@(

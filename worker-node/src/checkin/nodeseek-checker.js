@@ -6,6 +6,10 @@ import { launchSystemChromeCdp } from './system-chrome-cdp.js';
 
 const SIGN_STATUS = '.head-info > div';
 
+export function normalizeSignMode(value) {
+  return value === 'luck' || value === 'lucky' ? 'lucky' : 'chicken';
+}
+
 export function isNodeSeekSite(site) {
   try {
     const hostname = new URL(site.url).hostname;
@@ -18,7 +22,7 @@ export function isNodeSeekSite(site) {
 export async function nodeSeekCheckin(site) {
   const startTime = Date.now();
   const config = site.config || {};
-  const signMode = config.signMode === 'lucky' ? 'lucky' : 'chicken';
+  const signMode = normalizeSignMode(config.signMode);
   let browserSession = null;
 
   try {
@@ -26,6 +30,7 @@ export async function nodeSeekCheckin(site) {
     const { context } = browserSession;
     const page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(30000);
+    site.markRemoteEffect?.();
     await page.goto(site.url, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,
@@ -55,6 +60,7 @@ export async function nodeSeekCheckin(site) {
       );
     }
 
+    site.markRemoteEffect?.();
     await page.goto(new URL('/board', site.url).href, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,

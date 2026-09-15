@@ -104,6 +104,7 @@ class SystemJobDispatcher:
         self._active_job_id: UUID | None = None
         self._user_cancelled: set[UUID] = set()
         self._stopping = asyncio.Event()
+        self.last_error: str | None = None
 
     def start(self) -> None:
         if not self._task or self._task.done():
@@ -135,6 +136,17 @@ class SystemJobDispatcher:
 
     async def _loop(self) -> None:
         while not self._stopping.is_set():
+            try:
+                await self._dispatch_forever()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = sanitize_log_value(exc, max_length=500)
+                logger.error("dispatcher recovered from error: %s", self.last_error)
+                await asyncio.sleep(self.interval_seconds)
+
+    async def _dispatch_forever(self) -> None:
+        while not self._stopping.is_set():
             job = None
             for kind in SYSTEM_JOB_KINDS:
                 if kind == JobKind.LOGIN_SESSION and self.supervisor.state != "ready":
@@ -142,6 +154,7 @@ class SystemJobDispatcher:
                 job = await self.service.lease(kind, "python-system")
                 if job:
                     break
+            self.last_error = None
             if not job:
                 await asyncio.sleep(self.interval_seconds)
                 continue

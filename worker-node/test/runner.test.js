@@ -113,3 +113,51 @@ test('artifacts expose only controlled relative metadata', async t => {
   fs.writeFileSync(outsidePath, bytes);
   assert.equal(await describeArtifact(outsidePath, root), null);
 });
+
+test('a pre-navigation infrastructure failure remains safe to retry', async () => {
+  const result = await executeCheckin(params(), {
+    resolveRunner: () => ({
+      id: 'fake', tracksRemoteEffect: true,
+      run: async () => { throw new Error('browser launch failed'); },
+    }),
+  });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.metadata.remoteEffect, 'not_started');
+  assert.match(result.metadata.nextAction, /安全重试/);
+});
+
+test('a lost result after execution starts remains unknown', async () => {
+  const result = await executeCheckin(params(), {
+    resolveRunner: () => ({
+      id: 'fake', tracksRemoteEffect: true,
+      run: async site => {
+        site.markRemoteEffect();
+        throw new Error('response connection lost');
+      },
+    }),
+  });
+  assert.equal(result.status, 'effect_unknown');
+  assert.equal(result.metadata.remoteEffect, 'possible');
+});
+
+test('blocked reconciliation never upgrades old uncertainty into a safe retry', async () => {
+  const result = await executeCheckin(params({ reconcile: true }), {
+    resolveRunner: () => ({ id: 'fake', tracksRemoteEffect: true, run: async () => assert.fail('must not execute') }),
+  });
+  assert.equal(result.metadata.remoteEffect, 'possible');
+  assert.equal(result.status, 'effect_unknown');
+});
+
+test('a profile occupied by login prevents check-in before any adapter action', async () => {
+  const { acquireProfile } = await import('../src/profile-locks.js');
+  const input = params();
+  const release = acquireProfile(input.accountId, 'login');
+  try {
+    const result = await executeCheckin(input, {
+      resolveRunner: () => ({ id: 'fake', run: async () => assert.fail('must not execute') }),
+    });
+    assert.equal(result.status, 'failed');
+    assert.equal(result.reasonCode, 'profile_busy');
+    assert.equal(result.metadata.remoteEffect, 'not_started');
+  } finally { release(); }
+});

@@ -19,12 +19,12 @@ databases into a new Site Hub database. It never edits either source database.
 - Target paths equal to either source DB, or inside the browser-profile source,
   are rejected before target initialization.
 - Normal `apply` requires a database path that does not yet exist, and the
-  importer independently rejects any target containing business rows. The only
-  supported resume against an existing imported database is `--profiles-only`.
+  importer independently rejects any target containing business rows. Supported asset-only resumes against an existing imported database are
+  `--profiles-only` and `--artifacts-only`; these flags are mutually exclusive.
 - A full `apply` also requires `--preflight-receipt`. The receipt is emitted only
   when `cutover-preflight.ps1` has zero blockers, expires within 60 minutes, and
   binds the absolute source paths and SHA-256 values, SiteHub target database,
-  Profile source/target, and SiteHub project path. Apply verifies it immediately
+  Profile and screenshot source/target paths and manifests, and SiteHub project path. Apply verifies it immediately
   before its first target write and again after the database snapshot/import.
 - The CLI claims a new target with exclusive file creation. If initialization or
   business import fails, it removes only the target DB and its exact `-wal`/`-shm`
@@ -126,3 +126,28 @@ SELECT counts_json, source_db_sha256, status FROM migration_runs;
 
 Expected results are `ok`, zero foreign-key rows, and a `succeeded` migration
 run. Imported schedules are intentionally paused for operator verification.
+
+## Screenshot migration and recovery
+
+Business import creates screenshot references; files and verified metadata are
+copied only with `--copy-artifacts`. Include these options in a full cutover:
+
+```powershell
+python tools\migrate_legacy.py apply `
+  --vshop-db C:\path\to\vshop.db `
+  --autocheckin-db C:\path\to\checkin.db `
+  --target-db C:\path\to\site-hub.db `
+  --preflight-receipt C:\path\to\cutover-receipt.json `
+  --copy-profiles --profile-source C:\path\to\browser-profiles `
+  --profile-target C:\path\to\site-hub\browser-profiles `
+  --copy-artifacts --artifact-source C:\path\to\screenshots `
+  --artifact-target C:\path\to\site-hub\artifacts
+```
+
+For screenshot-only recovery, use the same source/target arguments with
+`--copy-artifacts --artifacts-only`, omit `--preflight-receipt` and the Profile
+copy options. The imported database's persisted binding authorizes only those
+frozen input hashes and paths. Existing copied files are verified before being
+reused. Changed source files are rejected; do not replace the frozen source with
+new data to force recovery to pass. Verify at least one historical screenshot
+through the artifact API after the migration.

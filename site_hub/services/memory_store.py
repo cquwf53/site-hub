@@ -703,8 +703,10 @@ class MemoryStore:
         return row
 
     async def list_products(self, *, page, page_size, site_id=None, q=None,
-                            availability_status=None, category_id=None):
+                            availability_status=None, category_id=None, watched=None):
         rows = list(self.products.values())
+        if watched is not None:
+            rows = [row for row in rows if bool(row.get("watched", False)) == watched]
         if site_id is not None:
             wanted_site = UUID(str(site_id))
             rows = [row for row in rows if UUID(str(row["site_id"])) == wanted_site]

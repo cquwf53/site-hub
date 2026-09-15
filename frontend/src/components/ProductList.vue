@@ -6,7 +6,7 @@ import ProductCategoryManager from './ProductCategoryManager.vue'
 import ProductDetailsDialog from './ProductDetailsDialog.vue'
 import StatusBadge from './StatusBadge.vue'
 import { api, apiErrorMessage } from '@/api/client'
-import type { Page, Product, ProductCategory } from '@/api/types'
+import type { Page, Product, ProductCategory, ProductWatchRule } from '@/api/types'
 import { formatDate, formatMoney, safeExternalUrl } from '@/utils/format'
 import { useAppStore } from '@/stores/app'
 
@@ -17,6 +17,8 @@ const categories = ref<ProductCategory[]>([])
 const loading = ref(true)
 const error = ref('')
 const search = ref('')
+const watchedOnly = ref(false)
+const watchBusy = ref<Set<string>>(new Set())
 const availability = ref('')
 const categoryId = ref('')
 const pageNo = ref(1)
@@ -29,6 +31,7 @@ async function load() {
   error.value = ''
   try {
     data.value = await api.get<Page<Product>>('/products', {
+      watched: watchedOnly.value || undefined,
       site_id: props.siteId,
       q: search.value,
       availability_status: availability.value,
@@ -54,6 +57,18 @@ function filter() {
 }
 
 function changePage(value: number) { pageNo.value = value; void load() }
+
+async function toggleWatch(product: Product) {
+  if (watchBusy.value.has(product.id)) return
+  watchBusy.value = new Set([...watchBusy.value, product.id])
+  try {
+    const current = await api.get<ProductWatchRule>(`/products/${product.id}/watch-rule`)
+    const updated = await api.put<ProductWatchRule>(`/products/${product.id}/watch-rule`, { ...current, watched: !current.watched })
+    product.watched = updated.watched
+    if (watchedOnly.value && !updated.watched) await load()
+  } catch (value) { app.toast(apiErrorMessage(value), 'error') }
+  finally { const next = new Set(watchBusy.value); next.delete(product.id); watchBusy.value = next }
+}
 
 async function openProduct(product: Product) {
   try {
@@ -90,6 +105,7 @@ onUnmounted(() => window.clearTimeout(timer))
     <label class="search-field"><input v-model="search" placeholder="搜索商品名称" @input="filter" /></label>
     <select v-model="categoryId" class="category-select" aria-label="商品分类" @change="filter"><option value="">全部分类</option><option v-for="category in categories" :key="category.id" :value="category.id">{{ siteId ? category.name : `${category.site_name} / ${category.name}` }}</option></select>
     <select v-model="availability" class="availability-select" aria-label="库存状态" @change="filter"><option value="">全部状态</option><option value="available">在售</option><option value="sold_out">售罄</option><option value="missing">抓取缺失</option><option value="delisted">明确下架</option><option value="unknown">未知</option></select>
+    <label><input v-model="watchedOnly" type="checkbox" @change="filter" /> 仅重点关注</label>
     <button class="button secondary small" @click="managerOpen = true">分类管理</button>
   </div>
   <section class="card">
@@ -102,7 +118,7 @@ onUnmounted(() => window.clearTimeout(timer))
           <td><strong>{{ formatMoney(product.price, product.currency) }}</strong></td>
           <td><StatusBadge :status="product.availability_status" :label="product.availability_status === 'available' ? '在售' : product.availability_status === 'sold_out' ? '售罄' : product.availability_status === 'missing' ? '抓取缺失' : product.availability_status === 'delisted' ? '明确下架' : product.availability_status" /></td>
           <td class="muted">{{ formatDate(product.updated_at) }}</td>
-          <td class="actions"><button class="text-button" @click="detailsId = product.id">详情</button><button v-if="product.buy_endpoint_id || safeExternalUrl(product.url)" class="icon-button" aria-label="打开商品" @click="openProduct(product)">↗</button></td>
+          <td class="actions"><button class="text-button" :disabled="watchBusy.has(product.id)" :aria-pressed="Boolean(product.watched)" :aria-label="`${product.name} 重点关注`" @click="toggleWatch(product)">{{ product.watched ? '★ 已关注' : '☆ 关注' }}</button><button class="text-button" @click="detailsId = product.id">详情</button><button v-if="product.buy_endpoint_id || safeExternalUrl(product.url)" class="icon-button" aria-label="打开商品" @click="openProduct(product)">↗</button></td>
         </tr>
       </tbody></table></div>
       <PaginationBar :page="data.page" :page-size="data.page_size" :total="data.total" @change="changePage" />

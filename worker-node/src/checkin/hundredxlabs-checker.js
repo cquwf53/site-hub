@@ -34,6 +34,7 @@ export async function hundredXLabsCheckin(site) {
     const checkinUrl = new URL('/check-in', site.url).href;
 
     const statusResponsePromise = waitForApiResponse(page, 'GET', STATUS_PATH, 20000);
+    site.markRemoteEffect?.();
     await page.goto(checkinUrl, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,

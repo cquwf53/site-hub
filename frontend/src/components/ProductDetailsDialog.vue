@@ -4,6 +4,7 @@ import AsyncState from './AsyncState.vue'
 import ModalDialog from './ModalDialog.vue'
 import PaginationBar from './PaginationBar.vue'
 import ProductPriceChart from './ProductPriceChart.vue'
+import ProductWatchEditor from './ProductWatchEditor.vue'
 import StatusBadge from './StatusBadge.vue'
 import { api, apiErrorMessage } from '@/api/client'
 import type { Page, PriceObservation, Product, ProductCategory } from '@/api/types'
@@ -109,6 +110,8 @@ onMounted(load)
             <PaginationBar v-if="history.total > history.page_size" :page="history.page" :page-size="history.page_size" :total="history.total" @change="loadHistory" />
           </AsyncState>
         </section>
+
+        <ProductWatchEditor :product-id="product.id" @updated="product.watched = $event.watched; emit('updated', product)" />
 
         <section class="detail-section category-editor">
           <div><h4>商品分类</h4><p>可跟随抓取分类，也可人工覆盖；人工选择不会被下次同步覆盖。</p></div>

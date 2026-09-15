@@ -41,6 +41,7 @@ export async function apiCheckin(site) {
   const startTime = Date.now();
 
   try {
+    site.markRemoteEffect?.();
     const { response, text } = await fetchTextWithLimits(checkinUrl, fetchOptions, {
       timeoutMs: config.timeoutMs,
       maxBytes: config.maxResponseBytes,

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import AsyncState from '@/components/AsyncState.vue'
+import DataMaintenancePanel from '@/components/DataMaintenancePanel.vue'
 import { api, apiErrorMessage } from '@/api/client'
 import type { TaskRef } from '@/api/types'
 import { useAppStore } from '@/stores/app'
@@ -144,6 +145,7 @@ onMounted(loadBackups)
 
 <template>
   <div class="stack">
+    <DataMaintenancePanel @changed="loadBackups" />
     <section class="card">
       <div class="card-header"><div><h2>数据库备份与恢复</h2><p class="subtle-text">使用 SQLite Backup API 创建一致性快照，并校验 SHA-256 与数据库完整性</p></div></div>
       <div class="backup-create">

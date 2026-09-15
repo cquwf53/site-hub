@@ -30,6 +30,7 @@ export async function xkoolCheckin(site) {
     page.setDefaultTimeout(30000);
     const profileUrl = new URL('/profile', site.url).href;
 
+    site.markRemoteEffect?.();
     await page.goto(profileUrl, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,

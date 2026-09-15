@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import AsyncState from '@/components/AsyncState.vue'
@@ -13,6 +13,7 @@ import { useAppStore } from '@/stores/app'
 import { useTaskStore } from '@/stores/tasks'
 import { formatDate, hostname } from '@/utils/format'
 import { siteTypeIcon } from '@/utils/siteType'
+import { readSiteListState } from '@/utils/siteListState'
 
 const ROOT_FOLDER_ID = '00000000-0000-0000-0000-000000000001'
 const route = useRoute()
@@ -38,6 +39,10 @@ const bulkTagId = ref('')
 const bulkSiteTypeId = ref('')
 const searchDraft = ref(String(route.query.q || ''))
 let searchTimer = 0
+let listRequestId = 0
+const bulkReport = ref<Array<{ id: string; name: string; error: string }>>([])
+const bulkReportTitle = ref('')
+let retryBulk: (() => Promise<void>) | null = null
 let directoryStatsRequestId = 0
 const siteForm = ref({ name: '', url: '', folder_id: null as string | null, site_type_id: null as string | null, tag_ids: [] as string[], pinned: false, capabilities: ['bookmark'] as string[] })
 const folderForm = ref({ name: '', parent_id: null as string | null })
@@ -80,20 +85,23 @@ async function loadDirectoryStats() {
 }
 
 async function load() {
+  const requestId = ++listRequestId
   loading.value = true; error.value = ''
   const statsRequest = loadDirectoryStats()
   try {
     const folder = selectedFolder.value
-    ;[page.value, folders.value, tags.value, siteTypes.value] = await Promise.all([
+    const result = await Promise.all([
       api.get<Page<Site>>('/sites', { page: route.query.page || 1, page_size: 20, q: route.query.q, folder_id: folder === 'unfiled' ? 'null' : folder, tag_id: route.query.tag, site_type_id: route.query.type }),
       api.get<Folder[]>('/folders'),
       api.get<Tag[]>('/tags'),
       api.get<SiteType[]>('/site-types'),
     ])
+    if (requestId !== listRequestId) return
+    ;[page.value, folders.value, tags.value, siteTypes.value] = result
     const visible = new Set(page.value.items.map((site) => site.id))
     selectedIds.value = new Set([...selectedIds.value].filter((id) => visible.has(id)))
-  } catch (value) { error.value = apiErrorMessage(value) }
-  finally { loading.value = false; await statsRequest }
+  } catch (value) { if (requestId === listRequestId) error.value = apiErrorMessage(value) }
+  finally { if (requestId === listRequestId) loading.value = false; await statsRequest }
 }
 
 function setQuery(values: Record<string, string | undefined>) {
@@ -151,45 +159,58 @@ function toggleAll() {
     : new Set(page.value.items.map((site) => site.id))
 }
 
-async function bulkMove() {
-  if (!selectedIds.value.size) return
-  const folderId = bulkFolderId.value === 'unfiled' ? null : bulkFolderId.value || null
+async function runBulk(title: string, sites: Site[], action: (site: Site) => Promise<unknown>) {
   saving.value = true
-  try {
-    await Promise.all([...selectedIds.value].map((id) => api.patch<Site>(`/sites/${id}`, { folder_id: folderId })))
-    app.toast(`已移动 ${selectedIds.value.size} 个网站`, 'success'); selectedIds.value = new Set(); await load()
-  } catch (value) { app.toast(apiErrorMessage(value), 'error') }
-  finally { saving.value = false }
+  bulkReportTitle.value = title
+  const results = await Promise.allSettled(sites.map(action))
+  bulkReport.value = sites.map((site, index) => {
+    const result = results[index]!
+    return { id: site.id, name: site.name, error: result.status === 'rejected' ? apiErrorMessage(result.reason) : '' }
+  })
+  const failed = sites.filter((_, index) => results[index]!.status === 'rejected')
+  selectedIds.value = new Set(failed.map((site) => site.id))
+  retryBulk = failed.length ? () => runBulk(title, failed, action) : null
+  app.toast(`${title}：成功 ${sites.length - failed.length} 项，失败 ${failed.length} 项`, failed.length ? 'error' : 'success')
+  await load()
+  saving.value = false
+}
+
+async function bulkMove() {
+  const folderId = bulkFolderId.value === 'unfiled' ? null : bulkFolderId.value || null
+  const sites = page.value.items.filter((site) => selectedIds.value.has(site.id))
+  if (sites.length) await runBulk('批量移动', sites, (site) => api.patch(`/sites/${site.id}`, { folder_id: folderId }))
 }
 
 async function bulkAddTag() {
-  if (!selectedIds.value.size || !bulkTagId.value) return
-  saving.value = true
-  try {
-    const selected = page.value.items.filter((site) => selectedIds.value.has(site.id))
-    await Promise.all(selected.map((site) => api.patch<Site>(`/sites/${site.id}`, {
-      tag_ids: [...new Set([...(site.tags || []).map((tag) => tag.id), bulkTagId.value])],
-    })))
-    app.toast(`已为 ${selected.length} 个网站添加标签`, 'success'); bulkTagId.value = ''; await load()
-  } catch (value) { app.toast(apiErrorMessage(value), 'error') }
-  finally { saving.value = false }
+  const tagId = bulkTagId.value
+  const sites = page.value.items.filter((site) => selectedIds.value.has(site.id))
+  if (!sites.length || !tagId) return
+  await runBulk('添加标签', sites, (site) => api.patch(`/sites/${site.id}`, {
+    tag_ids: [...new Set([...(site.tags || []).map((tag) => tag.id), tagId])],
+  }))
 }
 
 async function bulkSetSiteType() {
-  if (!selectedIds.value.size || !bulkSiteTypeId.value) return
+  const sites = page.value.items.filter((site) => selectedIds.value.has(site.id))
+  if (!sites.length || !bulkSiteTypeId.value) return
   saving.value = true
+  bulkReportTitle.value = '设置网站类型'
   try {
-    await api.post<{ updated: number; site_type_id: string; site_ids: string[] }>('/sites/bulk/site-type', {
-      site_ids: [...selectedIds.value],
-      site_type_id: bulkSiteTypeId.value,
-    })
-    app.toast(`已设置 ${selectedIds.value.size} 个网站的类型`, 'success')
+    await api.post('/sites/bulk/site-type', { site_ids: sites.map((site) => site.id), site_type_id: bulkSiteTypeId.value })
+    bulkReport.value = sites.map((site) => ({ id: site.id, name: site.name, error: '' }))
+    app.toast(`已设置 ${sites.length} 个网站的类型`, 'success')
     bulkSiteTypeId.value = ''
     selectedIds.value = new Set()
+    retryBulk = null
     await load()
-  } catch (value) { app.toast(apiErrorMessage(value), 'error') }
-  finally { saving.value = false }
+  } catch (value) {
+    bulkReport.value = sites.map((site) => ({ id: site.id, name: site.name, error: apiErrorMessage(value) }))
+    retryBulk = bulkSetSiteType
+    app.toast(apiErrorMessage(value), 'error')
+  } finally { saving.value = false }
 }
+
+function retryFailed() { return retryBulk?.() }
 
 function siteTypeStyle(siteType?: SiteType | null) {
   const color = siteType?.color || '#6e7078'
@@ -208,8 +229,9 @@ async function importBookmarks(event: Event) {
   finally { input.value = '' }
 }
 
-watch(() => route.query, load, { deep: true })
-onMounted(load)
+watch(() => route.query, () => { searchDraft.value = String(route.query.q || ''); void load() }, { deep: true })
+onMounted(async () => { await load(); await nextTick(); const saved = readSiteListState(); if (saved?.fullPath === route.fullPath) window.scrollTo({ top: saved.scrollTop }) })
+onUnmounted(() => { window.clearTimeout(searchTimer); ++listRequestId })
 </script>
 
 <template>
@@ -247,6 +269,11 @@ onMounted(load)
         <button class="button secondary small" :disabled="saving || !bulkSiteTypeId" @click="bulkSetSiteType">设置类型</button>
         <button class="text-button" @click="selectedIds = new Set()">取消选择</button>
       </div>
+      <section v-if="bulkReport.length" class="card card-body" role="status" aria-label="批量操作结果">
+        <div class="row-between"><strong>{{ bulkReportTitle }}：成功 {{ bulkReport.filter(item => !item.error).length }} 项，失败 {{ bulkReport.filter(item => item.error).length }} 项</strong><button class="text-button" @click="bulkReport = []">关闭</button></div>
+        <ul><li v-for="item in bulkReport" :key="item.id">{{ item.name }}：{{ item.error || '成功' }}</li></ul>
+        <button v-if="bulkReport.some(item => item.error)" class="button secondary small" :disabled="saving" @click="retryFailed">仅重试失败项</button>
+      </section>
       <div class="card">
         <AsyncState :loading="loading" :error="error" :empty="!page.items.length" empty-title="还没有网站" empty-text="添加第一个网站，或导入浏览器导出的 HTML 书签。" @retry="load">
           <template #empty-action><button class="button" @click="createOpen = true">添加网站</button></template>

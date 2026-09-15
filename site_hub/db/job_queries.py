@@ -6,8 +6,9 @@ from typing import Any
 from site_hub.db.connection import Database
 
 
-JOB_SELECT = """SELECT j.*,c.code capability_code
-                FROM jobs j LEFT JOIN capability_instances c ON c.id=j.capability_instance_id"""
+JOB_SELECT = """SELECT j.*,c.code capability_code,st.name site_name,a.label account_label
+                FROM jobs j LEFT JOIN capability_instances c ON c.id=j.capability_instance_id
+                LEFT JOIN sites st ON st.id=j.site_id LEFT JOIN site_accounts a ON a.id=j.account_id"""
 
 
 def normalize_job_statuses(status: str | Iterable[str] | None) -> tuple[str, ...]:

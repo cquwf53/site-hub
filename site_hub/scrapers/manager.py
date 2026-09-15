@@ -163,7 +163,7 @@ class ProductScraperService:
         # The old manager deliberately did not overwrite a catalog when a
         # scraper succeeded but found zero products.  Preserve that safety rule.
         persisted: dict[str, int] = {"created": 0, "updated": 0, "missing": 0}
-        if result.products:
+        if result.products or hasattr(self.store, "get_monitor_policy"):
             persisted = await self.store.save_scrape_result(
                 UUID(str(site["id"])),
                 result.products,

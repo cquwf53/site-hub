@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from site_hub.config import Settings
-from site_hub.db import Database, MIGRATIONS, apply_migrations
+from site_hub.db import Database, MIGRATIONS, SCHEMA_VERSION, apply_migrations
 from site_hub.db.connection import stable_uuid
 from site_hub.main import create_app
 from site_hub.services.backups import BackupService
@@ -58,7 +58,7 @@ def test_v2_upgrade_preserves_known_and_unknown_site_kinds(tmp_path):
     apply_migrations(database)
 
     with database.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         rows = {
             row["slug"]: dict(row) for row in conn.execute(
                 "SELECT * FROM site_types WHERE slug IN ('shop','forum')"
@@ -137,7 +137,7 @@ def test_staged_v2_restore_is_upgraded_before_sitehub_becomes_ready(tmp_path):
         }
 
     with database.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert backups.pending_restore() is None
 

@@ -46,7 +46,7 @@ function Invoke-Checked {
 function Test-SupportedPython([string]$Executable) {
     try {
         if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { return $false }
-        & $Executable -c 'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)' *> $null
+        & $Executable -c 'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)' *> $null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -72,7 +72,6 @@ function Resolve-BasePython {
         [pscustomobject]@{ File = 'py.exe'; Args = @('-3.13') },
         [pscustomobject]@{ File = 'py.exe'; Args = @('-3.12') },
         [pscustomobject]@{ File = 'py.exe'; Args = @('-3.11') },
-        [pscustomobject]@{ File = 'py.exe'; Args = @('-3.10') },
         [pscustomobject]@{ File = 'python.exe'; Args = @() },
         [pscustomobject]@{ File = $bundled; Args = @() }
     )
@@ -80,7 +79,7 @@ function Resolve-BasePython {
         try {
             $probeArgs = @($candidate.Args) + @(
                 '-c',
-                'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)'
+                'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)'
             )
             & $candidate.File @probeArgs *> $null
             if ($LASTEXITCODE -eq 0) { return $candidate }
@@ -92,7 +91,7 @@ function Resolve-BasePython {
 function Resolve-VerificationPython {
     if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
         $resolved = Resolve-Executable $PythonPath
-        Assert-True (Test-SupportedPython $resolved) "Python 3.10-3.13 is required: $resolved"
+        Assert-True (Test-SupportedPython $resolved) "Python 3.11-3.13 is required: $resolved"
         return $resolved
     }
     if (Test-SupportedPython $venvPython) { return $venvPython }
@@ -101,7 +100,7 @@ function Resolve-VerificationPython {
     }
 
     $base = Resolve-BasePython
-    Assert-True ($null -ne $base) 'Python 3.10-3.13 is required to create the project environment.'
+    Assert-True ($null -ne $base) 'Python 3.11-3.13 is required to create the project environment.'
     $expected = [System.IO.Path]::GetFullPath((Join-Path $projectRoot '.venv'))
     $resolvedVenv = [System.IO.Path]::GetFullPath($venvDir)
     Assert-True ($resolvedVenv.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase)) "Refusing to replace unexpected environment path: $resolvedVenv"
@@ -215,6 +214,7 @@ try {
             '-m', 'pytest', '-q', '-m', 'not integration and not profile',
             '--basetemp', (Join-Path $runRoot 'pytest')
         ) 'Running the Python test suite'
+        Invoke-Checked $python @((Join-Path $PSScriptRoot 'generate-api-types.py'), '--check') 'Checking generated OpenAPI TypeScript contracts'
         Invoke-Checked $npm.Source @('run', 'test:worker') 'Running the Node Worker test suite'
         Invoke-Checked $npm.Source @('run', 'test:frontend') 'Running the Vue test suite'
         Invoke-Checked $npm.Source @('run', 'typecheck') 'Running Vue TypeScript checks'

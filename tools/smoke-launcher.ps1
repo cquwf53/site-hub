@@ -311,7 +311,7 @@ function Wait-Ready($Launch, [int]$TimeoutSeconds) {
 
 function Test-PythonEnvironment([string]$PythonPath) {
     if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { return $false }
-    & $PythonPath -c 'import sys, fastapi, uvicorn, httpx, playwright, aiosqlite, apscheduler, ddddocr, psutil; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)' *> $null
+    & $PythonPath -c 'import sys, fastapi, uvicorn, httpx, playwright, aiosqlite, apscheduler, ddddocr, psutil; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)' *> $null
     if ($LASTEXITCODE -ne 0) { return $false }
     & $PythonPath -m pip check *> $null
     return $LASTEXITCODE -eq 0
@@ -426,7 +426,7 @@ function Invoke-StaleVenvRecovery {
         Assert-True (-not (Test-Path -LiteralPath $sentinel)) 'start.ps1 did not remove the stale .venv contents.'
         $fixturePython = Join-Path $fixtureVenv 'Scripts\python.exe'
         Assert-True (Test-Path -LiteralPath $fixturePython -PathType Leaf) 'start.ps1 did not recreate .venv in the fixture.'
-        & $fixturePython -c 'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)' *> $null
+        & $fixturePython -c 'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)' *> $null
         Assert-True ($LASTEXITCODE -eq 0) 'The recreated fixture .venv is not a valid supported Python environment.'
         $fixtureOutput = ([string]$script:selfHealLaunch.StdoutTask.Result) + "`n" + ([string]$script:selfHealLaunch.StderrTask.Result)
         Assert-True ($fixtureOutput -match 'Creating an isolated Python environment') 'The fixture did not exercise the stale-.venv recreation branch.'

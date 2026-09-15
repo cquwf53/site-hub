@@ -51,6 +51,7 @@ class Database:
             conn = sqlite3.connect(self.path, timeout=self.timeout, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.create_function("sitehub_uuid", 1, stable_uuid, deterministic=True)
+        conn.create_function("casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(f"PRAGMA busy_timeout = {int(self.timeout * 1000)}")
         if not self.readonly:

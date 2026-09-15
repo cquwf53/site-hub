@@ -4,6 +4,7 @@ import { spawn } from 'child_process';
 import { PROFILES_DIR, profileDirFor } from '../runtime-paths.js';
 import { trackChildProcess } from '../process-registry.js';
 import { redactText } from '../redact.js';
+import { acquireProfile } from '../profile-locks.js';
 import { launchSystemChromeCdp } from './system-chrome-cdp.js';
 
 function normalizeAccountKey(value) {
@@ -71,6 +72,26 @@ export async function isAuthenticatedPage(site, page) {
     hostname = new URL(site.url).hostname;
   } catch {
     return false;
+  }
+
+  if (hostname === 'new.xkool.cfd') {
+    // Dashboard URLs can also be rendered to guests; require a live session.
+    try {
+      if (new URL(page.url()).origin !== new URL(site.url).origin) return false;
+      return await page.evaluate(async () => {
+        try {
+          let userId;
+          try { userId = Number(JSON.parse(localStorage.getItem('user') || 'null')?.id); } catch {}
+          const response = await fetch('/api/user/self', {
+            credentials: 'include',
+            headers: userId > 0 ? { 'New-Api-User': String(userId) } : {},
+          });
+          if (!response.ok) return false;
+          const payload = await response.json();
+          return payload.success === true && Number(payload.data?.id) > 0;
+        } catch { return false; }
+      });
+    } catch { return false; }
   }
 
   if (hostname === 'nodeloc.com' || hostname === 'www.nodeloc.com') {
@@ -264,6 +285,7 @@ export class LoginSessionManager {
     this.sessions.set(siteId, session);
 
     try {
+      session.releaseProfile = acquireProfile(siteId, 'login');
       const browserProcess = trackChildProcess(spawn(executable, [
         `--user-data-dir=${getProfileDir(siteId)}`,
         '--no-first-run',
@@ -283,7 +305,9 @@ export class LoginSessionManager {
 
       session.state = 'running';
       browserProcess.once('exit', () => {
+        session.releaseProfile?.();
         this.sessions.delete(siteId);
+        if (session.closed) return;
         const timer = setTimeout(() => {
           void this.verify(site).then(result => {
             if (typeof onComplete === 'function') onComplete(result);
@@ -302,9 +326,10 @@ export class LoginSessionManager {
       browserProcess.unref();
       return this.getStatus(site);
     } catch (error) {
+      session.releaseProfile?.();
       this.sessions.delete(siteId);
       return {
-        state: 'error',
+        state: error.code === 'PROFILE_BUSY' ? 'busy' : 'error',
         startedAt: session.startedAt,
         authenticatedAt: null,
         currentUrl: session.currentUrl,
@@ -341,6 +366,7 @@ export class LoginSessionManager {
     this.sessions.set(siteId, session);
 
     try {
+      session.releaseProfile = acquireProfile(siteId, 'verification');
       const hostname = new URL(site.url).hostname;
       if (
         hostname === 'nodeseek.com'
@@ -387,7 +413,7 @@ export class LoginSessionManager {
       };
     } catch (error) {
       const message = redactText(error?.message || error, 1000);
-      const busy = /user data directory is already in use|ProcessSingleton|profile.*in use/i
+      const busy = error.code === 'PROFILE_BUSY' || /user data directory is already in use|ProcessSingleton|profile.*in use/i
         .test(message);
       return {
         state: busy ? 'busy' : 'error',
@@ -403,6 +429,7 @@ export class LoginSessionManager {
       } else if (session.context) {
         await session.context.close().catch(() => {});
       }
+      session.releaseProfile?.();
       this.sessions.delete(siteId);
     }
   }
@@ -424,6 +451,7 @@ export class LoginSessionManager {
     this.sessions.set(siteId, session);
 
     try {
+      session.releaseProfile = acquireProfile(siteId, 'login');
       fs.mkdirSync(getProfileDir(siteId), { recursive: true });
       const { chromium } = await import('playwright');
       const context = await chromium.launchPersistentContext(getProfileDir(siteId), {
@@ -482,6 +510,7 @@ export class LoginSessionManager {
       context.pages().forEach(inspectPage);
       context.on('page', inspectPage);
       context.on('close', () => {
+        session.releaseProfile?.();
         clearTimeout(session.authCheckTimer);
         this.sessions.delete(siteId);
       });
@@ -507,6 +536,7 @@ export class LoginSessionManager {
       if (session.context) {
         await session.context.close().catch(() => {});
       }
+      session.releaseProfile?.();
       this.sessions.delete(siteId);
       return errorStatus;
     }
@@ -516,6 +546,7 @@ export class LoginSessionManager {
     const key = String(siteId);
     const session = this.sessions.get(key);
     if (!session) return false;
+    session.closed = true;
     clearTimeout(session.authCheckTimer);
     if (session.browserSession) {
       await session.browserSession.close().catch(() => {});
@@ -524,6 +555,9 @@ export class LoginSessionManager {
     }
     if (session.browserProcess && session.browserProcess.exitCode === null) {
       session.browserProcess.kill();
+      // Its exit handler owns release until Chrome has really exited.
+    } else {
+      session.releaseProfile?.();
     }
     this.sessions.delete(key);
     return true;

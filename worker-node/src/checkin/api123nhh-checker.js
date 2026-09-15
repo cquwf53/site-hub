@@ -33,6 +33,7 @@ export async function api123NhhCheckin(site) {
     const personalUrl = new URL('/console/personal', site.url).href;
 
     const statusResponsePromise = waitForCheckinResponse(page, 'GET', 20000);
+    site.markRemoteEffect?.();
     await page.goto(personalUrl, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,

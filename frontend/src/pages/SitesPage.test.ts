@@ -179,4 +179,24 @@ describe('SitesPage website types', () => {
       site_type_id: 'type-tool',
     })
   })
+  it('reports partial bulk failures and retries only failed websites', async () => {
+    const original = apiMocks.get.getMockImplementation()!
+    apiMocks.get.mockImplementation((path: string, ...args: unknown[]) => path === '/sites'
+      ? Promise.resolve({ items: [{ ...site }, { ...site, id: 'site-2', name: '失败站点' }], page: 1, page_size: 20, total: 2 })
+      : original(path, ...args))
+    apiMocks.patch.mockImplementation((path: string) => path.endsWith('site-2') ? Promise.reject(new Error('目标目录不可用')) : Promise.resolve(site))
+    const { wrapper } = await renderPage()
+    await wrapper.get('input[aria-label="选择本页全部网站"]').setValue(true)
+    await wrapper.get('select[aria-label="批量移动目标目录"]').setValue('unfiled')
+    await wrapper.findAll('button').find(button => button.text() === '批量移动')!.trigger('click'); await flushPromises()
+    const report = wrapper.get('[aria-label="批量操作结果"]')
+    expect(report.text()).toContain('成功 1 项，失败 1 项')
+    expect(report.text()).toContain('失败站点：目标目录不可用')
+    apiMocks.patch.mockResolvedValue(site)
+    await report.findAll('button').find(button => button.text() === '仅重试失败项')!.trigger('click'); await flushPromises()
+    expect(apiMocks.patch.mock.calls.filter(([path]) => path === '/sites/site-1')).toHaveLength(1)
+    expect(apiMocks.patch.mock.calls.filter(([path]) => path === '/sites/site-2')).toHaveLength(2)
+    wrapper.unmount()
+  })
+
 })

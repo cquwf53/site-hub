@@ -373,6 +373,9 @@ class JobOut(BaseModel):
     status: JobStatus
     site_id: UUID | None = None
     account_id: UUID | None = None
+    site_name: str | None = None
+    account_label: str | None = None
+    updated_at: datetime | None = None
     scheduled_for: datetime
     attempt: int = 0
     max_attempts: int = 3

@@ -6,12 +6,12 @@ import ProductList from './ProductList.vue'
 const apiMocks = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(),
+  put: vi.fn(),
 }))
 
 vi.mock('@/api/client', () => ({
   api: {
     ...apiMocks,
-    put: vi.fn(),
     patch: vi.fn(),
     delete: vi.fn(),
   },
@@ -56,4 +56,16 @@ describe('ProductList', () => {
     expect(wrapper.find('.product-thumb').exists()).toBe(false)
     expect(wrapper.find('img').exists()).toBe(false)
   })
+  it('toggles attention without clearing existing per-product thresholds', async () => {
+    const original = apiMocks.get.getMockImplementation()!
+    apiMocks.get.mockImplementation((path: string, ...args: unknown[]) => path.endsWith('/watch-rule')
+      ? Promise.resolve({ watched: false, price_drop_amount: 12, price_drop_percent: null }) : original(path, ...args))
+    apiMocks.put.mockResolvedValue({ watched: true, price_drop_amount: 12, price_drop_percent: null })
+    const wrapper = mount(ProductList, { global: { plugins: [createPinia()], stubs: { RouterLink: true } } }); await flushPromises()
+    await wrapper.get('button[aria-label="测试商品 重点关注"]').trigger('click'); await flushPromises()
+    expect(apiMocks.put).toHaveBeenCalledWith('/products/product-1/watch-rule', { watched: true, price_drop_amount: 12, price_drop_percent: null })
+    expect(wrapper.get('button[aria-label="测试商品 重点关注"]').attributes('aria-pressed')).toBe('true')
+    wrapper.unmount()
+  })
+
 })

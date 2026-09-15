@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from site_hub.jobs.service import JobService
-from site_hub.models import JobKind, JobStatus
+from site_hub.models import JobKind, JobStatus, JobOut, Page, TaskRef
 
 
 router = APIRouter()
@@ -32,7 +32,7 @@ def _not_found(message: str) -> None:
     raise HTTPException(404, detail={"code": "NOT_FOUND", "message": message})
 
 
-@router.get("/jobs")
+@router.get("/jobs", response_model=Page[JobOut])
 async def list_jobs(
     request: Request,
     page: int = Query(1, ge=1),
@@ -59,7 +59,7 @@ async def list_jobs(
     )
 
 
-@router.get("/jobs/{job_id}")
+@router.get("/jobs/{job_id}", response_model=JobOut)
 async def get_job(request: Request, job_id: UUID):
     row = await _store(request).get_job(job_id)
     if not row:
@@ -67,7 +67,7 @@ async def get_job(request: Request, job_id: UUID):
     return _jobs(request).public_job(row)
 
 
-@router.post("/jobs/{job_id}/cancel")
+@router.post("/jobs/{job_id}/cancel", response_model=JobOut)
 async def cancel_job(request: Request, job_id: UUID):
     row = await _jobs(request).cancel(job_id)
     await request.app.state.dispatcher.cancel_execution(job_id)
@@ -77,7 +77,7 @@ async def cancel_job(request: Request, job_id: UUID):
     return _jobs(request).public_job(row)
 
 
-@router.post("/jobs/{job_id}/retry")
+@router.post("/jobs/{job_id}/retry", response_model=TaskRef)
 async def retry_job(request: Request, job_id: UUID):
     row = await _jobs(request).retry(job_id)
     return _jobs(request).task_ref(row).model_dump(mode="json", by_alias=True)

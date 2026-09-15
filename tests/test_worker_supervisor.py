@@ -333,3 +333,87 @@ async def test_external_worker_kill_cleans_owned_child_and_restarts(tmp_path, mo
         await _wait_until(lambda: not _process_is_alive(first_child_pid))
     finally:
         await supervisor.stop()
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object behavior")
+@pytest.mark.asyncio
+async def test_ping_timeout_recycles_a_live_worker_and_its_child(tmp_path, monkeypatch):
+    entry = tmp_path / "worker-node" / "src" / "unresponsive_worker.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text(
+        FAKE_WORKER.replace(
+            'send({"jsonrpc":"2.0","id":message["id"],"result":{"ok":True}})',
+            'pass  # Deliberately keep running without acknowledging ping.',
+        ), encoding="utf-8",
+    )
+    child_pid_file = tmp_path / "child.pid"
+    monkeypatch.setenv("SITEHUB_TEST_CHILD_PID_FILE", str(child_pid_file))
+    supervisor = NodeWorkerSupervisor(
+        JobService(MemoryStore(), EventBroker()), executable=sys.executable, entry=entry,
+        profiles_dir=tmp_path / "profiles", artifacts_dir=tmp_path / "artifacts",
+        handshake_seconds=5, ping_seconds=0.05, shutdown_seconds=1,
+    )
+    supervisor.start()
+    try:
+        await _wait_until(lambda: supervisor.state == "ready" and child_pid_file.is_file())
+        first_pid = supervisor.pid
+        child_pid = int(child_pid_file.read_text(encoding="ascii"))
+        assert _process_is_alive(first_pid) and _process_is_alive(child_pid)
+        await _wait_until(
+            lambda: supervisor.restart_count >= 1
+            and supervisor.state == "ready"
+            and supervisor.pid not in {None, first_pid},
+        )
+        assert not _process_is_alive(first_pid)
+        await _wait_until(lambda: not _process_is_alive(child_pid))
+    finally:
+        await supervisor.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote_effect,reconcile", [
+    ("not_started", False), ("possible", True), ("unexpected", True), (None, True),
+])
+async def test_retry_dispatch_requires_trusted_not_started_provenance(tmp_path, remote_effect, reconcile):
+    store = MemoryStore()
+    site = await store.create_site({"name": "Site", "url": "https://example.test", "status": "active"})
+    account = await store.create_account(UUID(str(site["id"])), {
+        "name": "Primary", "adapter": "api", "enabled": True,
+    })
+    jobs = JobService(store, EventBroker())
+    task, _ = await jobs.enqueue_checkin(UUID(str(account["id"])))
+    store.jobs[task.job_id]["attempt"] = 1
+    store.jobs[task.job_id]["payload"] = {"retry_context": {"remote_effect": remote_effect}}
+    peer = RecordingPeer()
+    supervisor = _bare_supervisor(jobs, tmp_path, peer)
+    loop_task = asyncio.create_task(supervisor._dispatch_loop())
+    try:
+        await asyncio.wait_for(peer.started.wait(), timeout=2)
+        start = next(params for method, params in peer.calls if method == "job.start")
+        assert start["reconcile"] is reconcile
+    finally:
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+
+
+@pytest.mark.asyncio
+async def test_start_ack_loss_keeps_remote_outcome_unknown(tmp_path):
+    class LostAckPeer(RecordingPeer):
+        async def request(self, method, params, *, timeout):
+            if method == "job.start":
+                raise TimeoutError("start acknowledgement lost")
+            return await super().request(method, params, timeout=timeout)
+
+    store = MemoryStore()
+    site = await store.create_site({"name": "Site", "url": "https://example.test", "status": "active"})
+    account = await store.create_account(UUID(str(site["id"])), {
+        "name": "Primary", "adapter": "api", "enabled": True,
+    })
+    jobs = JobService(store, EventBroker())
+    task, _ = await jobs.enqueue_checkin(UUID(str(account["id"])))
+    supervisor = _bare_supervisor(jobs, tmp_path, LostAckPeer())
+    await asyncio.wait_for(supervisor._dispatch_loop(), timeout=2)
+    row = await store.get_job(task.job_id)
+    assert row["status"] == "effect_unknown"
+    assert row["error_kind"] == "dispatch_unknown"
+    assert row["result"]["metadata"]["remoteEffect"] == "possible"

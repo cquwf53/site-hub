@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from site_hub.config import Settings
-from site_hub.db import Database, MIGRATIONS, apply_migrations
+from site_hub.db import Database, MIGRATIONS, SCHEMA_VERSION, apply_migrations
 from site_hub.main import create_app
 from site_hub.services.data_store import DataLayerStore
 from site_hub.services.memory_store import MemoryStore
@@ -65,7 +65,7 @@ def test_v3_upgrade_adds_hidden_preference_without_changing_existing_rows(tmp_pa
     apply_migrations(database)
 
     with database.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         row = conn.execute(
             "SELECT overview_hidden FROM sites WHERE id='site'"
         ).fetchone()

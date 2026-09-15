@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import TaskDrawer from './TaskDrawer.vue'
 import { useAppStore } from '@/stores/app'
@@ -17,7 +17,8 @@ const navigation = [
   { to: '/settings/general', label: '设置', glyph: '⚙' },
 ]
 const title = computed(() => String(route.meta.title || 'SiteHub'))
-onMounted(() => tasks.connect())
+onMounted(() => { tasks.connect(); app.startWorkerMonitoring() })
+onUnmounted(() => app.stopWorkerMonitoring())
 </script>
 
 <template>
@@ -31,7 +32,7 @@ onMounted(() => tasks.connect())
       </nav>
       <div class="sidebar-foot">
         <span class="presence-dot" :class="{ online: app.workerOnline }" />
-        <span>{{ app.workerOnline ? 'Worker 已连接' : 'Worker 未连接' }}</span>
+        <span :title="app.workerStatusError || undefined">{{ app.workerStatusLabel }}</span>
       </div>
     </aside>
     <button v-if="app.mobileNavOpen" class="nav-scrim" aria-label="关闭导航" @click="app.mobileNavOpen = false" />
