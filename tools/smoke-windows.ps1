@@ -74,9 +74,9 @@ function Resolve-Executable([string]$Value) {
 
 function Test-Python([string]$Executable, [switch]$RequireDependencies) {
     try {
-        $probe = 'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)'
+        $probe = 'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)'
         if ($RequireDependencies) {
-            $probe = 'import sys, fastapi, uvicorn, httpx, playwright; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)'
+            $probe = 'import sys, fastapi, uvicorn, httpx, playwright; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)'
         }
         & $Executable -c $probe *> $null
         return $LASTEXITCODE -eq 0
@@ -96,7 +96,7 @@ function Resolve-BasePython {
     }
     $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
     if ($null -ne $launcher) {
-        foreach ($selector in @('-3.13', '-3.12', '-3.11', '-3.10')) {
+        foreach ($selector in @('-3.13', '-3.12', '-3.11')) {
             try {
                 $resolved = (& $launcher.Source $selector -c 'import sys; print(sys.executable)' 2>$null).Trim()
                 if ($resolved) { $candidates.Add($resolved) }
@@ -112,7 +112,7 @@ function Resolve-BasePython {
 function Resolve-SmokePython {
     if ($PythonPath) {
         $resolved = Resolve-Executable $PythonPath
-        Assert-True (Test-Python $resolved) "Python 3.10-3.13 is required: $resolved"
+        Assert-True (Test-Python $resolved) "Python 3.11-3.13 is required: $resolved"
         return $resolved
     }
 
@@ -126,7 +126,7 @@ function Resolve-SmokePython {
     }
 
     $basePython = Resolve-BasePython
-    Assert-True ($null -ne $basePython) 'Python 3.10-3.13 is required to create the project environment.'
+    Assert-True ($null -ne $basePython) 'Python 3.11-3.13 is required to create the project environment.'
     Write-Step 'Creating .venv for the smoke test.'
     & $basePython -m venv (Join-Path $projectRoot '.venv')
     Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $venvPython -PathType Leaf)) 'Unable to create .venv.'

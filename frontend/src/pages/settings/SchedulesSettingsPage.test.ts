@@ -153,4 +153,16 @@ describe('SchedulesSettingsPage', () => {
       enabled: false,
     })
   })
+  it('displays the server blocking reason and an actionable configuration link beside the next run', async () => {
+    const original = apiMocks.get.getMockImplementation()!
+    apiMocks.get.mockImplementation((path: string, ...args: unknown[]) => path === '/schedules'
+      ? Promise.resolve({ items: [{ ...scheduleItems[1], enabled: true, next_run_at: '2026-09-16T01:00:00Z', blocked_reason: '账号登录已过期', next_action: { label: '重新登录并验证', href: '/sites/site-checkin/accounts', description: '完成登录后恢复计划' } }], page: 1, page_size: 200, total: 1 })
+      : original(path, ...args))
+    const wrapper = await renderPage()
+    expect(wrapper.text()).toContain('账号登录已过期')
+    expect(wrapper.text()).toContain('重新登录并验证')
+    expect(wrapper.text()).toContain('解除阻止后')
+    wrapper.unmount()
+  })
+
 })

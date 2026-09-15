@@ -8,12 +8,13 @@ import { hundredXLabsCheckin, isHundredXLabsSite } from './hundredxlabs-checker.
 import { api123NhhCheckin, isApi123NhhSite } from './api123nhh-checker.js';
 import { btschoolCheckin, isBtschoolSite } from './btschool-checker.js';
 import { is52PojieSite, poJie52Checkin } from './pojie52-checker.js';
-import { isJianzhileSite, jianzhileCheckin } from './jianzhile-checker.js';
+import { isJianzhileSite, jianzhileCheckin, jianzhileCheckAlreadyDone } from './jianzhile-checker.js';
 import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import { SCREENSHOTS_DIR } from '../runtime-paths.js';
 import { redactText } from '../redact.js';
+import { acquireProfile } from '../profile-locks.js';
 
 const dedicatedAdapters = [
   { id: 'xkool', match: isXkoolSite, run: xkoolCheckin },
@@ -21,28 +22,30 @@ const dedicatedAdapters = [
   { id: 'nodeseek', match: isNodeSeekSite, run: nodeSeekCheckin },
   { id: 'hundredxlabs', match: isHundredXLabsSite, run: hundredXLabsCheckin },
   { id: 'api123nhh', match: isApi123NhhSite, run: api123NhhCheckin },
-  { id: 'jianzhile', match: isJianzhileSite, run: jianzhileCheckin },
+  { id: 'jianzhile', match: isJianzhileSite, run: jianzhileCheckin, checkAlreadyDone: jianzhileCheckAlreadyDone },
   { id: 'btschool', match: isBtschoolSite, run: btschoolCheckin },
   { id: '52pojie', match: is52PojieSite, run: poJie52Checkin },
 ];
 
+for (const adapter of dedicatedAdapters) adapter.tracksRemoteEffect = true;
 const byId = new Map(dedicatedAdapters.map(item => [item.id, item]));
 
 export function resolveCheckinRunner(site, adapterId) {
-  if (adapterId === 'api') return { id: 'api', run: apiCheckin };
-  if (adapterId === 'cookie') return { id: 'cookie', run: cookieCheckin };
+  if (adapterId === 'api') return { id: 'api', run: apiCheckin, tracksRemoteEffect: true };
+  if (adapterId === 'cookie') return { id: 'cookie', run: cookieCheckin, tracksRemoteEffect: true };
   if (adapterId === 'playwright-generic') {
-    return { id: adapterId, run: playwrightCheckin, checkAlreadyDone: playwrightCheckAlreadyDone };
+    return { id: adapterId, run: playwrightCheckin, tracksRemoteEffect: true, checkAlreadyDone: playwrightCheckAlreadyDone };
   }
   if (adapterId && byId.has(adapterId)) return byId.get(adapterId);
 
   const matched = dedicatedAdapters.find(item => item.match(site));
   if (matched) return matched;
-  if (site.mode === 'api') return { id: 'api', run: apiCheckin };
-  if (site.mode === 'cookie') return { id: 'cookie', run: cookieCheckin };
+  if (site.mode === 'api') return { id: 'api', run: apiCheckin, tracksRemoteEffect: true };
+  if (site.mode === 'cookie') return { id: 'cookie', run: cookieCheckin, tracksRemoteEffect: true };
   return {
     id: 'playwright-generic',
     run: playwrightCheckin,
+    tracksRemoteEffect: true,
     checkAlreadyDone: playwrightCheckAlreadyDone,
   };
 }
@@ -50,6 +53,9 @@ export function resolveCheckinRunner(site, adapterId) {
 function reasonFor(result) {
   if (result.reasonCode) return String(result.reasonCode);
   const message = String(result.message || '').toLowerCase();
+  if (result.code === 'PROFILE_BUSY' || /profile.*(busy|in use)|processsingleton|正在使用|正在用于/.test(message)) return 'profile_busy';
+  if (/executable.*(exist|found)|browser.*(install|launch)|未找到系统.*chrome|playwright 未安装/.test(message)) return 'browser_unavailable';
+  if (/cross-origin redirect blocked/.test(message)) return 'redirect_blocked';
   if (result.status === 'success') return 'success';
   if (result.status === 'skipped' && /(already|已签|今日)/i.test(message)) return 'already_done';
   if (/(login|sign-in|cookie|登录|登入|未配置)/i.test(message)) return 'needs_login';
@@ -149,11 +155,32 @@ export async function executeCheckin(params, options = {}) {
   const resolveRunner = options.resolveRunner || resolveCheckinRunner;
   const artifactRoot = options.artifactRoot || SCREENSHOTS_DIR;
   const runner = resolveRunner(site, account.adapter || config.adapter);
+  // Preserve uncertainty from an earlier attempt until a read-only check
+  // conclusively proves no effect. A blocked reconciliation is never safe to replay.
+  let remoteEffect = params.reconcile ? 'possible' : 'not_started';
+  site.markRemoteEffect = () => { remoteEffect = 'possible'; };
   let result;
-  if (params.reconcile) {
-    result = await reconcileBeforeRetry(runner, site);
+  let releaseProfile;
+  try {
+    if (!['api', 'cookie'].includes(runner.id)) {
+      releaseProfile = acquireProfile(site.id, 'checkin');
+    }
+    if (params.reconcile) {
+      result = await reconcileBeforeRetry(runner, site);
+      if (!result) remoteEffect = 'not_started';
+    }
+    if (!result) {
+      if (!runner.tracksRemoteEffect) site.markRemoteEffect();
+      result = await runner.run(site);
+    }
+  } catch (error) {
+    result = { status: 'failed', code: error.code, message: error?.message || String(error) };
+  } finally {
+    releaseProfile?.();
   }
-  if (!result) result = await runner.run(site);
+  if (remoteEffect === 'possible' && result?.status === 'failed') {
+    result = { ...result, status: 'effect_unknown' };
+  }
   const artifacts = [];
   if (result?.screenshot) {
     const artifact = await describeArtifact(result.screenshot, artifactRoot);
@@ -167,7 +194,15 @@ export async function executeCheckin(params, options = {}) {
     message: redactText(result?.message || 'Adapter returned no result', 2000),
     durationMs: Number(result?.duration_ms ?? (Date.now() - startedAt)),
     artifacts,
-    metadata: { adapterId: runner.id },
+    metadata: {
+      adapterId: runner.id,
+      remoteEffect,
+      nextAction: remoteEffect === 'not_started'
+        ? '解决登录窗口占用、浏览器或配置问题后，可安全重试。'
+        : result?.status === 'effect_unknown'
+          ? '请先在站点确认今日签到结果；重试时会先只读核实，无法核实时不会重复签到。'
+          : null,
+    },
   };
 }
 

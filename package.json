@@ -11,7 +11,9 @@
     "typecheck": "npm run typecheck --workspace frontend",
     "test": "npm run test --workspaces --if-present",
     "test:worker": "npm run test --workspace worker-node",
-    "test:frontend": "npm run test --workspace frontend"
+    "test:frontend": "npm run test --workspace frontend",
+    "api:generate": ".venv\\Scripts\\python.exe tools/generate-api-types.py",
+    "api:check": ".venv\\Scripts\\python.exe tools/generate-api-types.py --check"
   },
   "engines": {
     "node": "^20.19.0 || >=22.12.0"

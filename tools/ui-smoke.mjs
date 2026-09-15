@@ -105,7 +105,8 @@ async function main() {
 
     async function waitForPage(selector, label) {
       await page.locator(selector).first().waitFor({ state: 'visible' })
-      await page.locator('[aria-busy="true"]').waitFor({ state: 'detached' })
+      // Pages may load several independent panels in parallel.
+      await page.waitForFunction(() => document.querySelectorAll('[aria-busy="true"]').length === 0)
       await assertClean(label)
     }
 

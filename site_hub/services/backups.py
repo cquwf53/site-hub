@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -197,7 +198,84 @@ class BackupService:
         """Validate the manifest, size, SHA-256, and SQLite integrity."""
         with self._mutex:
             record = self._load_record(backup_id, verify_contents=True)
-            return BackupVerification(record=record, verified_at=_utc_now())
+            verification = BackupVerification(record=record, verified_at=_utc_now())
+            self._save_verification(verification)
+            return verification
+
+    def latest_verification(self) -> dict[str, Any] | None:
+        """Return the last completed integrity check, including checks from the UI."""
+        with self._mutex:
+            root = self._ensure_backup_root()
+            path = root / "verification-latest.json"
+            if not path.exists():
+                return None
+            self._assert_regular_managed_file(path, root, "verification record")
+            try:
+                if path.stat().st_size > _MAX_MANIFEST_BYTES:
+                    return None
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(value, dict) or not isinstance(value.get("verified_at"), str):
+                    return None
+                self._validate_backup_id(value["backup_id"])
+                if not _is_utc_timestamp(value["verified_at"]) or value["integrity_check"] != "ok":
+                    return None
+                return {key: value[key] for key in ("backup_id", "verified_at", "integrity_check")}
+            except (BackupError, OSError, ValueError, TypeError, KeyError):
+                return None
+
+    def _save_verification(self, verification: BackupVerification) -> None:
+        root = self._ensure_backup_root()
+        path = root / "verification-latest.json"
+        temporary = root / f".verification-{uuid.uuid4().hex}.tmp"
+        try:
+            _write_json_fsync(temporary, {
+                "backup_id": verification.record.backup_id,
+                "verified_at": verification.verified_at,
+                "integrity_check": verification.integrity_check,
+            })
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @contextmanager
+    def retention_guard(self):
+        """Serialize cleanup with staging/cancelling a restore request."""
+        with self._mutex:
+            yield self._load_pending_restore() is None
+
+    def prune_automatic_backups(self, keep_count: int) -> int:
+        """Retain newest automatic snapshots, all manual/rollback and staged backups.
+
+        Unknown files make a directory ineligible; deletion never recurses.
+        The maintenance caller first creates a fresh verified snapshot.
+        """
+        if isinstance(keep_count, bool) or keep_count < 1:
+            raise ValueError("at least one automatic backup must be retained")
+        with self._mutex:
+            pending = self._load_pending_restore()
+            records = [item.record for item in self.list_backups()
+                       if item.record is not None and item.record.kind == "automatic"]
+            if not records:
+                return 0
+            self._load_record(records[0].backup_id, verify_contents=True)
+            protected = {record.backup_id for record in records[:keep_count]}
+            if pending is not None:
+                protected.add(pending.backup_id)
+            removed = 0
+            for record in records:
+                if record.backup_id in protected:
+                    continue
+                directory = self._safe_backup_dir(record.backup_id, must_exist=True)
+                children = list(directory.iterdir())
+                if {child.name for child in children} != {DATABASE_FILENAME, MANIFEST_FILENAME}:
+                    continue
+                for child in children:
+                    self._assert_regular_managed_file(child, directory, "backup file")
+                (directory / DATABASE_FILENAME).unlink()
+                (directory / MANIFEST_FILENAME).unlink()
+                directory.rmdir()
+                removed += 1
+            return removed
 
     def stage_restore(self, backup_id: str) -> PendingRestore:
         """Verify a backup and arrange an offline restore for the next startup."""
@@ -454,6 +532,7 @@ class BackupService:
             self._verify_database_file(destination_path, record)
             temporary_dir.replace(final_dir)
             _fsync_directory(root)
+            self._save_verification(BackupVerification(record=record, verified_at=_utc_now()))
             return record
         except BaseException:
             shutil.rmtree(temporary_dir, ignore_errors=True)

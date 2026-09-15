@@ -27,6 +27,7 @@ class JobDispatcher:
         self.product_concurrency = asyncio.Semaphore(product_concurrency)
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        self.last_error: str | None = None
         self._inflight: set[asyncio.Task[Any]] = set()
         self._inflight_by_job: dict[UUID, asyncio.Task[Any]] = {}
 
@@ -59,9 +60,25 @@ class JobDispatcher:
 
     async def _loop(self) -> None:
         while not self._stopping.is_set():
+            try:
+                await self._dispatch_forever()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = sanitize_log_value(exc, max_length=500)
+                logger.error("dispatcher recovered from error: %s", self.last_error)
+                await asyncio.sleep(self.interval_seconds)
+
+    async def _dispatch_forever(self) -> None:
+        while not self._stopping.is_set():
             await self.service.recover()
             await self.product_concurrency.acquire()
-            job = await self.service.lease(JobKind.PRODUCT_SYNC, "python-product")
+            try:
+                job = await self.service.lease(JobKind.PRODUCT_SYNC, "python-product")
+                self.last_error = None
+            except BaseException:
+                self.product_concurrency.release()
+                raise
             if not job:
                 self.product_concurrency.release()
                 await asyncio.sleep(self.interval_seconds); continue
@@ -87,6 +104,10 @@ class JobDispatcher:
             site = await getter(UUID(str(job["site_id"])))
             if not site: raise LookupError("site was deleted")
             result = await self.product_handler(site, job)
+            if result.get("catalog_anomaly"):
+                await self.service.complete(job_id, token, status=JobStatus.FAILED, result=result,
+                    error_kind="catalog_anomaly", error_message="商品抓取数量异常，已保留原目录；请检查抓取器后再同步")
+                return
             status = JobStatus.SKIPPED if result.get("skipped") else JobStatus.SUCCEEDED
             await self.service.complete(job_id, token, status=status, result=result)
         except StaleLease:
@@ -104,7 +125,7 @@ class JobDispatcher:
         finally:
             if heartbeat:
                 heartbeat.cancel()
-                with suppress(asyncio.CancelledError): await heartbeat
+                with suppress(asyncio.CancelledError, Exception): await heartbeat
             self.product_concurrency.release()
 
     async def _heartbeat(self, job_id: UUID, token: str) -> None:

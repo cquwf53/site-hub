@@ -180,4 +180,21 @@ describe('SiteAccountsPage', () => {
     expect(apiMocks.post).toHaveBeenCalledWith('/accounts/account-api/run')
     wrapper.unmount()
   })
+  it('edits reactive account config and creates from adapter defaults without losing nested values', async () => {
+    apiMocks.get.mockImplementation((path: string) => Promise.resolve(path === '/adapters' ? [{
+      id: 'api', name: 'API', version: '1', capabilities: ['checkin'], secret_fields: [],
+      defaults: { headers: { Accept: 'application/json' } }, account_config_schema: { type: 'object' },
+    }] : [{ id: 'account-1', label: 'Nested', adapter: 'api', enabled: true, auth_state: 'ready', configured_secret_fields: [], config: { headers: { Accept: 'text/html' } } }]))
+    const wrapper = mount(SiteAccountsPage, { global: { plugins: [createPinia()], stubs: { Teleport: true } } })
+    await flushPromises()
+    const edit = wrapper.findAll('button').find(button => button.text() === '配置')
+    await edit!.trigger('click'); await flushPromises()
+    await wrapper.get('#account-editor').trigger('submit'); await flushPromises()
+    expect(apiMocks.patch).toHaveBeenCalledWith('/accounts/account-1', expect.objectContaining({ config: { headers: { Accept: 'text/html' } } }))
+    await wrapper.findAll('button').find(button => button.text().includes('添加账号'))!.trigger('click')
+    await wrapper.get('#account-editor').trigger('submit'); await flushPromises()
+    expect(apiMocks.post).toHaveBeenCalledWith('/sites/site-1/accounts', expect.objectContaining({ config: { headers: { Accept: 'application/json' } } }))
+    wrapper.unmount()
+  })
+
 })

@@ -71,3 +71,42 @@ test.after(() => {
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
+test('jianzhile reconciliation only reads today status and always closes its context', async () => {
+  const { jianzhileCheckAlreadyDone } = await import('../src/checkin/jianzhile-checker.js');
+  for (const [today, httpOk] of [[true, true], [false, true], [undefined, true], [false, false]]) {
+    let closed = false;
+    const reads = [];
+    const page = {
+      goto: async url => { assert.equal(url, 'https://jianzhile.vip/console/personal'); },
+      evaluate: async (callback, args) => {
+        reads.push(args);
+        const { runInNewContext } = await import('node:vm');
+        return await runInNewContext(`(${callback.toString()})(args)`, {
+          args,
+          localStorage: { getItem: () => '{"id":123}' },
+          fetch: async (url, options) => {
+            assert.match(url, /^\/api\/user\/checkin\?month=\d{4}-\d{2}$/);
+            assert.equal(options.method || 'GET', 'GET');
+            assert.equal(options.headers['New-Api-User'], '123');
+            return { ok: httpOk, json: async () => ({ success: true, data: { stats: { checked_in_today: today } } }) };
+          },
+        });
+      },
+    };
+    const chromium = {
+      launchPersistentContext: async () => ({
+        pages: () => [page],
+        close: async () => { closed = true; },
+      }),
+    };
+    const result = await jianzhileCheckAlreadyDone({
+      id: 'reconcile-account', url: 'https://jianzhile.vip/', config: {},
+    }, { chromium });
+    assert.equal(result.conclusive, httpOk && typeof today === 'boolean');
+    if (result.conclusive) assert.equal(result.done, today);
+    assert.equal(reads.length, 2);
+    assert.equal(reads[1].checkinPath, '/api/user/checkin');
+    assert.equal(closed, true);
+  }
+});

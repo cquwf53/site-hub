@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { installSiteListNavigation } from '@/utils/siteListState'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -46,8 +47,10 @@ const router = createRouter({
     },
     { path: '/:pathMatch(.*)*', name: 'not-found', component: () => import('@/pages/NotFoundPage.vue'), meta: { title: '页面不存在' } },
   ],
-  scrollBehavior: () => ({ top: 0 }),
+  scrollBehavior: (to, _from, savedPosition) => to.path === '/sites' ? false : savedPosition || { top: 0 },
 })
+
+installSiteListNavigation(router)
 
 router.afterEach((to) => { document.title = `${String(to.meta.title || 'SiteHub')} · SiteHub` })
 export default router

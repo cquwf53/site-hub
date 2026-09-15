@@ -51,6 +51,7 @@ class NotificationOutboxExecutor:
         self.secrets = secrets
         self.transport = transport or HttpxWebhookTransport()
         self.policy: NotificationPolicy = store.policy
+        self.last_error: str | None = None
         self.worker_id = worker_id or f"notification-{uuid4().hex}"
         if len(self.worker_id) > 150:
             raise ValueError("worker_id cannot exceed 150 characters")
@@ -136,7 +137,16 @@ class NotificationOutboxExecutor:
         if poll_interval_seconds <= 0:
             raise ValueError("poll interval must be positive")
         while not stop_event.is_set():
-            result = await self.run_once()
+            try:
+                result = await self.run_once()
+                self.last_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Claim/store failures must not permanently kill notifications.
+                # Keep exception text out of public state and logs.
+                self.last_error = "notification_store_unavailable"
+                result = None
             if result is not None:
                 continue
             try:

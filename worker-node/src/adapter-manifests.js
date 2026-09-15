@@ -112,7 +112,7 @@ export const adapterManifests = [
       ...commonAccountSchema,
       properties: {
         ...commonAccountSchema.properties,
-        signMode: { type: 'string', enum: ['chicken', 'luck'], default: 'chicken' },
+        signMode: { type: 'string', enum: ['chicken', 'luck', 'lucky'], default: 'chicken' },
       },
     },
   }),

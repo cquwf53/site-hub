@@ -24,6 +24,8 @@ interface ScheduleItem {
   enabled: boolean
   policy_type: string
   timezone: string
+  blocked_reason?: string | null
+  next_action?: { label: string; href?: string | null; description?: string | null } | null
   next_run_at?: string | null
   current_job_id?: string | null
   current_status?: string | null
@@ -252,6 +254,7 @@ function policyLabel(item: ScheduleItem) {
 }
 
 function nextRunLabel(item: ScheduleItem) {
+  if (item.blocked_reason) return item.blocked_reason
   if (!item.enabled) return '已停用'
   if (item.capability === 'product_monitor' && item.automatic_run_supported === false) {
     return item.automatic_run_reason === 'manual_catalog' ? '手工目录，不自动抓取' : '等待配置抓取器'
@@ -352,7 +355,7 @@ onMounted(load)
             <tr v-for="item in filteredItems" :key="item.id">
               <td><div class="schedule-name"><strong>{{ item.site_name }}</strong><small>{{ capabilityLabel(item.capability) }}<template v-if="item.account_label"> · {{ item.account_label }}</template></small><small v-if="accountStateError(item)" class="account-state-error" :title="accountStateError(item)">账号状态加载失败</small></div></td>
               <td><div class="policy-cell"><strong>{{ policyLabel(item) }}</strong><small v-if="item.capability === 'product_monitor' && item.automatic_run_supported === false" class="unsupported-run">{{ item.automatic_run_reason === 'manual_catalog' ? '当前为手工商品目录' : '尚未配置自动抓取器' }}</small><small v-else>{{ item.timezone }} · {{ item.misfire_policy === 'recover' ? '错过后恢复' : item.misfire_policy || '标准策略' }}</small></div></td>
-              <td><span class="next-run" :class="{ muted: !item.next_run_at }">{{ nextRunLabel(item) }}</span></td>
+              <td><div class="policy-cell"><span class="next-run" :class="{ muted: !item.next_run_at }">{{ nextRunLabel(item) }}</span><small v-if="item.blocked_reason && item.next_run_at">预计 {{ formatDate(item.next_run_at) }}（解除阻止后）</small><RouterLink v-if="item.next_action?.href" class="text-button" :to="item.next_action.href" :title="item.next_action.description || undefined">{{ item.next_action.label }}</RouterLink><small v-else-if="item.next_action">{{ item.next_action.description || item.next_action.label }}</small></div></td>
               <td><div class="last-result"><div v-if="item.current_status" class="current-job"><span>当前</span><StatusBadge :status="item.current_status" :label="resultStatusLabel(item.current_status)" /></div><StatusBadge v-if="item.last_status" :status="item.last_status" :label="lastResultLabel(item)" /><span v-else-if="!item.current_status" class="muted">尚未运行</span><small v-if="item.last_error_message" :title="item.last_error_message">{{ item.last_error_message }}</small><small v-else-if="item.last_run_at">{{ formatDate(item.last_run_at) }}</small></div></td>
               <td><StatusBadge :status="item.enabled ? 'enabled' : 'disabled'" /></td>
               <td class="actions"><RouterLink class="text-button" :to="item.capability === 'checkin' ? `/sites/${item.site_id}/accounts` : `/sites/${item.site_id}/settings`">配置</RouterLink><button class="switch schedule-switch" :class="{ on: item.enabled }" :aria-label="`${item.site_name} ${item.enabled ? '停用' : '启用'}`" :aria-pressed="item.enabled" :data-testid="`toggle-schedule-${item.id}`" :disabled="!canToggle(item)" :title="toggleTitle(item)" @click="toggle(item)" /></td>

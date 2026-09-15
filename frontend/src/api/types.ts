@@ -1,3 +1,5 @@
+import type * as Generated from './generated'
+
 export type ID = string
 
 export interface Page<T> {
@@ -13,15 +15,9 @@ export interface SiteDirectoryStats {
   by_folder: Record<string, number>
 }
 
-export interface TaskRef {
-  jobId: string
-  status: TaskStatus
-  deduplicated: boolean
-  kind?: string
-  href?: string
-}
+export type TaskRef = Generated.TaskRef
 
-export type TaskStatus = 'queued' | 'leased' | 'running' | 'succeeded' | 'failed' | 'skipped' | 'effect_unknown' | 'cancelled'
+export type TaskStatus = Generated.JobStatus
 
 export interface Bootstrap {
   csrf_token: string
@@ -135,6 +131,7 @@ export type AccountSchedule =
   | { mode: 'custom_window'; start: string; end: string; timezone?: string }
 
 export interface Product {
+  watched?: boolean
   id: ID
   site_id: ID
   site_name?: string
@@ -233,23 +230,9 @@ export interface NotificationChannelPage {
   total: number
 }
 
-export interface Job {
-  id: ID
-  kind?: string
-  site_id?: ID
-  site_name?: string
-  account_label?: string
-  business_date?: string
-  planned_at?: string | null
-  available_at?: string | null
-  status: TaskStatus | string
-  attempt?: number
-  max_attempts?: number
+export type Job = Generated.JobOut & {
   message?: string | null
-  error_message?: string | null
-  progress?: number | null
-  created_at?: string
-  updated_at?: string
+  business_date?: string
 }
 
 export interface Run {
@@ -311,3 +294,9 @@ export interface ApiErrorBody {
   error: { code: string; message: string; field?: string; context?: Record<string, unknown> }
   request_id?: string
 }
+
+export type MonitorPolicy = Required<Generated.MonitorPolicy>
+export type ProductWatchRule = Required<Generated.ProductWatchRule>
+
+export type MaintenanceSettings = Required<Generated.MaintenanceSettings>
+export type MaintenanceStatus = Generated.MaintenanceStatus

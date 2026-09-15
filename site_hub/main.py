@@ -26,6 +26,7 @@ from site_hub.notifications import (
 from site_hub.scrapers.network import sanitize_log_value
 from site_hub.scheduling.coordinator import ScheduleCoordinator
 from site_hub.services.backups import BackupService
+from site_hub.services.maintenance import MaintenanceService
 from site_hub.services.data_store import DataLayerStore
 from site_hub.services.ports import AccountNotReady
 from site_hub.services.events import EventBroker
@@ -87,6 +88,13 @@ def create_app(*, settings: Settings | None = None, store: Store | None = None,
                     restored.rollback_backup.backup_id,
                 )
             try:
+                if restored is None and runtime.db_path.is_file():
+                    # Preserve the on-disk schema before applying an irreversible migration.
+                    from site_hub.db.schema import SCHEMA_VERSION
+                    with sqlite3.connect(runtime.db_path.resolve().as_uri() + "?mode=ro", uri=True) as existing:
+                        previous_version = existing.execute("PRAGMA user_version").fetchone()[0]
+                    if 0 < previous_version < SCHEMA_VERSION:
+                        backups.create_backup(label=f"Before schema upgrade {previous_version} -> {SCHEMA_VERSION}")
                 await durable_store.initialize()
                 store_initialized = True
                 await jobs.recover()
@@ -101,6 +109,10 @@ def create_app(*, settings: Settings | None = None, store: Store | None = None,
                     app.state.notification_channels = channel_service
                     app.state.notification_executor = notification_executor
                     await asyncio.to_thread(outbox_store.recover_expired)
+                if database is not None:
+                    maintenance = MaintenanceService(database, backups, runtime.data_dir)
+                    await asyncio.to_thread(maintenance.initialize)
+                    app.state.maintenance = maintenance
                 if restored is not None:
                     backups.confirm_pending_restore(restored.restored_backup.backup_id)
             except BaseException:
@@ -118,6 +130,8 @@ def create_app(*, settings: Settings | None = None, store: Store | None = None,
                     )
                 raise
             if start_background:
+                if app.state.maintenance is not None:
+                    await app.state.maintenance.start()
                 supervisor.start(); supervisor_started = True
                 scheduler.start(); scheduler_started = True
                 dispatcher.start(); dispatcher_started = True
@@ -132,19 +146,20 @@ def create_app(*, settings: Settings | None = None, store: Store | None = None,
         finally:
             try:
                 notification_stop.set()
-                stops = []
-                if supervisor_started:
-                    stops.append(supervisor.stop())
-                if system_dispatcher_started:
-                    stops.append(system_dispatcher.stop())
-                if dispatcher_started:
-                    stops.append(dispatcher.stop())
+                # Stop producers before consumers, and finish maintenance threads
+                # while the database and instance lock are still owned.
                 if scheduler_started:
-                    stops.append(scheduler.stop())
+                    await asyncio.gather(scheduler.stop(), return_exceptions=True)
+                if app.state.maintenance is not None:
+                    await asyncio.gather(app.state.maintenance.stop(), return_exceptions=True)
+                if system_dispatcher_started:
+                    await asyncio.gather(system_dispatcher.stop(), return_exceptions=True)
+                if dispatcher_started:
+                    await asyncio.gather(dispatcher.stop(), return_exceptions=True)
+                if supervisor_started:
+                    await asyncio.gather(supervisor.stop(), return_exceptions=True)
                 if notification_task is not None:
-                    stops.append(notification_task)
-                if stops:
-                    await asyncio.gather(*stops, return_exceptions=True)
+                    await asyncio.gather(notification_task, return_exceptions=True)
                 pending = tuple(app.state.background_tasks)
                 for task in pending:
                     task.cancel()
@@ -170,6 +185,7 @@ def create_app(*, settings: Settings | None = None, store: Store | None = None,
     app.state.system_dispatcher = system_dispatcher
     app.state.bookmark_staging = bookmark_staging
     app.state.backups = backups
+    app.state.maintenance = None
     app.state.notification_channels = None
     app.state.notification_executor = None
     app.state.notification_task = None

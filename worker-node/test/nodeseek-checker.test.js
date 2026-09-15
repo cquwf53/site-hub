@@ -24,3 +24,11 @@ test.after(() => {
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
+test('NodeSeek accepts both manifest luck and legacy lucky settings', async () => {
+  const { normalizeSignMode } = await import('../src/checkin/nodeseek-checker.js');
+  assert.equal(normalizeSignMode('luck'), 'lucky');
+  assert.equal(normalizeSignMode('lucky'), 'lucky');
+  assert.equal(normalizeSignMode('chicken'), 'chicken');
+  assert.equal(normalizeSignMode(undefined), 'chicken');
+});

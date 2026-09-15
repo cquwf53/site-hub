@@ -7,10 +7,13 @@ Set fileSystem = CreateObject("Scripting.FileSystemObject")
 toolsDir = fileSystem.GetParentFolderName(WScript.ScriptFullName)
 projectDir = fileSystem.GetParentFolderName(toolsDir)
 launcher = fileSystem.BuildPath(projectDir, "start.ps1")
-dataDir = fileSystem.BuildPath(projectDir, "data")
+dataDir = shell.Environment("Process")("SITEHUB_DATA_DIR")
+If Len(Trim(dataDir)) = 0 Then dataDir = fileSystem.BuildPath(projectDir, "data")
+shell.CurrentDirectory = projectDir
+dataDir = fileSystem.GetAbsolutePathName(dataDir)
 logsDir = fileSystem.BuildPath(dataDir, "logs")
-If Not fileSystem.FolderExists(dataDir) Then fileSystem.CreateFolder dataDir
-If Not fileSystem.FolderExists(logsDir) Then fileSystem.CreateFolder logsDir
+EnsureFolder dataDir
+EnsureFolder logsDir
 logFile = fileSystem.BuildPath(logsDir, "startup.log")
 
 ' Startup tasks must not steal focus by opening a browser. Output is retained for diagnosis.
@@ -19,3 +22,11 @@ command = "cmd.exe /d /s /c ""powershell.exe -NoProfile -NonInteractive -Executi
 
 exitCode = shell.Run(command, 0, True)
 WScript.Quit exitCode
+
+Sub EnsureFolder(folderPath)
+    Dim parentPath
+    If fileSystem.FolderExists(folderPath) Then Exit Sub
+    parentPath = fileSystem.GetParentFolderName(folderPath)
+    If Len(parentPath) > 0 And parentPath <> folderPath Then EnsureFolder parentPath
+    fileSystem.CreateFolder folderPath
+End Sub

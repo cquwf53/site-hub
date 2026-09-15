@@ -138,3 +138,52 @@ test.after(() => {
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
+test('XKool live verification requires an authenticated API result on its own origin', async () => {
+  let requests = 0;
+  const page = (origin, authenticated) => ({
+    url: () => origin,
+    evaluate: async () => { requests += 1; return authenticated; },
+  });
+  const site = { url: 'https://new.xkool.cfd/dashboard/overview' };
+  assert.equal(await isAuthenticatedPage(site, page(site.url, true)), true);
+  assert.equal(await isAuthenticatedPage(site, page(site.url, false)), false);
+  assert.equal(await isAuthenticatedPage(site, page('https://other.test/', true)), false);
+  assert.equal(requests, 2);
+});
+
+test('profile verification returns busy while a check-in owns the same profile', async () => {
+  const { acquireProfile } = await import('../src/profile-locks.js');
+  const site = { id: 'locked-account', url: 'https://new.xkool.cfd/' };
+  const release = acquireProfile(site.id, 'checkin');
+  try {
+    const status = await loginSessionManager.verify(site);
+    assert.equal(status.state, 'busy');
+  } finally { release(); }
+  const reacquired = acquireProfile(site.id, 'after-checkin');
+  reacquired();
+});
+
+test('XKool verification validates the live API payload instead of trusting cached user data', async () => {
+  const { runInNewContext } = await import('node:vm');
+  for (const payload of [
+    { success: true, data: { id: 42 } },
+    { success: false, data: { id: 42 } },
+    { success: true, data: {} },
+  ]) {
+    const page = {
+      url: () => 'https://new.xkool.cfd/dashboard/overview',
+      evaluate: callback => runInNewContext(`(${callback.toString()})()`, {
+        localStorage: { getItem: () => '{"id":42}' },
+        fetch: async (url, options) => {
+          assert.equal(url, '/api/user/self');
+          assert.equal(options.method || 'GET', 'GET');
+          assert.equal(options.headers['New-Api-User'], '42');
+          return { ok: true, json: async () => payload };
+        },
+      }),
+    };
+    assert.equal(await isAuthenticatedPage({ url: page.url() }, page),
+      payload.success === true && payload.data.id === 42);
+  }
+});

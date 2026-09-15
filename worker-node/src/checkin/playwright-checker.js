@@ -43,6 +43,7 @@ async function preparePage(context, site, { preActions = true } = {}) {
   const page = context.pages()[0] || await context.newPage();
   page.setDefaultTimeout(30000);
   const targetUrl = preActions ? site.url : (config.reconcileUrl || site.url);
+  site.markRemoteEffect?.();
   await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
   if (config.waitSelector) {
@@ -59,6 +60,7 @@ async function preparePage(context, site, { preActions = true } = {}) {
         } else if (action.type === 'wait') {
           await page.waitForTimeout(action.duration || 1000);
         } else if (action.type === 'goto') {
+          site.markRemoteEffect?.();
           await page.goto(action.url, { waitUntil: 'domcontentloaded' });
         }
       } catch {

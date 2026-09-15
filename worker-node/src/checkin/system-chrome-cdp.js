@@ -41,7 +41,9 @@ async function waitForDevtools(port, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+      const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+        signal: AbortSignal.timeout(Math.max(1, Math.min(1000, deadline - Date.now()))),
+      });
       if (response.ok) return;
     } catch {
       // Chrome is still starting.
@@ -89,7 +91,7 @@ export async function launchSystemChromeCdp(profileDir) {
   try {
     await waitForDevtools(port);
     const { chromium } = await import('playwright');
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 15000 });
     const context = browser.contexts()[0];
     if (!context) throw new Error('普通 Chrome 未提供可用的浏览器上下文');
 

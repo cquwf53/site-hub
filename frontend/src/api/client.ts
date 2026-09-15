@@ -73,7 +73,7 @@ export function getBootstrap(force = false): Promise<Bootstrap> {
 }
 
 export const api = {
-  get: <T>(path: string, query?: Record<string, unknown>) => rawRequest<T>(path, {}, query),
+  get: <T>(path: string, query?: Record<string, unknown>, options?: Pick<RequestInit, 'signal'>) => rawRequest<T>(path, options || {}, query),
   post: <T>(path: string, body?: unknown) => rawRequest<T>(path, { method: 'POST', body: body instanceof FormData ? body : body === undefined ? undefined : JSON.stringify(body) }),
   put: <T>(path: string, body?: unknown) => rawRequest<T>(path, { method: 'PUT', body: body === undefined ? undefined : JSON.stringify(body) }),
   patch: <T>(path: string, body?: unknown) => rawRequest<T>(path, { method: 'PATCH', body: body === undefined ? undefined : JSON.stringify(body) }),

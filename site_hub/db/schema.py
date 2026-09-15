@@ -469,11 +469,32 @@ V4_STATEMENTS = (
 )
 
 
+V5_STATEMENTS = (
+    """CREATE TABLE product_watch_rules (
+        product_id TEXT PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+        watched INTEGER NOT NULL DEFAULT 0 CHECK(watched IN (0,1)),
+        price_drop_amount REAL CHECK(price_drop_amount IS NULL OR price_drop_amount>=0),
+        price_drop_percent REAL CHECK(price_drop_percent IS NULL OR price_drop_percent BETWEEN 0 AND 100)
+    )""",
+    "CREATE INDEX idx_product_watch_rules_watched ON product_watch_rules(watched,product_id)",
+    """CREATE TABLE product_monitor_state (
+        product_id TEXT PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+        pending_availability TEXT,
+        pending_count INTEGER NOT NULL DEFAULT 0,
+        last_job_id TEXT,
+        reference_price REAL,
+        last_price_alert_at TEXT,
+        last_stock_alert_at TEXT
+    )""",
+)
+
+
 MIGRATIONS = (
     Migration(1, "initial-unified-schema", V1_STATEMENTS),
     Migration(2, "preserve-manual-product-categories", V2_STATEMENTS),
     Migration(3, "controlled-site-types", V3_STATEMENTS),
     Migration(4, "overview-site-preferences", V4_STATEMENTS),
+    Migration(5, "product-monitor-rules", V5_STATEMENTS),
 )
 SCHEMA_VERSION = MIGRATIONS[-1].version
 

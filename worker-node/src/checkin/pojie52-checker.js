@@ -29,6 +29,7 @@ export async function poJie52Checkin(site) {
     const page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(30000);
 
+    site.markRemoteEffect?.();
     await page.goto(site.url, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,
@@ -72,6 +73,7 @@ export async function poJie52Checkin(site) {
     } else {
       // 部分皮肤下入口存在但不可见，退回直接访问任务链接
       const href = await checkinLink.getAttribute('href');
+      site.markRemoteEffect?.();
       await page.goto(new URL(href, page.url()).href, {
         waitUntil: 'domcontentloaded',
         timeout: 30000,
@@ -88,6 +90,7 @@ export async function poJie52Checkin(site) {
       ).first().innerText().catch(() => ''),
     );
 
+    site.markRemoteEffect?.();
     await page.goto(site.url, {
       waitUntil: 'domcontentloaded',
       timeout: 30000,

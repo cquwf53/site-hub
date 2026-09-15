@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, toRaw } from 'vue'
 import AsyncState from '@/components/AsyncState.vue'
 import DynamicSchemaForm from '@/components/DynamicSchemaForm.vue'
 import ModalDialog from '@/components/ModalDialog.vue'
@@ -46,18 +46,18 @@ function scheduleRefresh() {
 function openCreate() {
   editingId.value = null
   const first = checkinManifests.value[0]
-  form.value = { label: `账号 ${accounts.value.length + 1}`, adapter: first?.id || '', enabled: false, config: structuredClone(first?.defaults || {}), clear_secrets: [], schedule_mode: 'inherit', fixed_time: '08:30', window_start: '07:30', window_end: '10:00' }
+  form.value = { label: `账号 ${accounts.value.length + 1}`, adapter: first?.id || '', enabled: false, config: structuredClone(toRaw(first?.defaults || {})), clear_secrets: [], schedule_mode: 'inherit', fixed_time: '08:30', window_start: '07:30', window_end: '10:00' }
   editorOpen.value = true
 }
 function openEdit(account: SiteAccount) {
   editingId.value = account.id
   const schedule = account.schedule_override
-  form.value = { label: account.label, adapter: account.adapter || '', enabled: account.enabled, config: structuredClone(account.config || account.config_json || {}), clear_secrets: [], schedule_mode: schedule?.mode || 'inherit', fixed_time: schedule?.mode === 'fixed_time' ? schedule.time : '08:30', window_start: schedule?.mode === 'custom_window' ? schedule.start : '07:30', window_end: schedule?.mode === 'custom_window' ? schedule.end : '10:00' }
+  form.value = { label: account.label, adapter: account.adapter || '', enabled: account.enabled, config: structuredClone(toRaw(account.config || account.config_json || {})), clear_secrets: [], schedule_mode: schedule?.mode || 'inherit', fixed_time: schedule?.mode === 'fixed_time' ? schedule.time : '08:30', window_start: schedule?.mode === 'custom_window' ? schedule.start : '07:30', window_end: schedule?.mode === 'custom_window' ? schedule.end : '10:00' }
   editorOpen.value = true
 }
 function adapterChanged() {
   const selected = manifests.value.find((item) => item.id === form.value.adapter)
-  form.value.config = structuredClone(selected?.defaults || {})
+  form.value.config = structuredClone(toRaw(selected?.defaults || {}))
   form.value.clear_secrets = []
   if (!['api', 'cookie'].includes(form.value.adapter)) form.value.enabled = false
 }

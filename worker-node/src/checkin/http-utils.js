@@ -8,12 +8,6 @@ function validateHttpUrl(value) {
   return parsed;
 }
 
-function withoutSensitiveCrossOriginHeaders(headers) {
-  const cleaned = new Headers(headers || {});
-  for (const name of ['authorization', 'cookie', 'proxy-authorization']) cleaned.delete(name);
-  return cleaned;
-}
-
 async function fetchWithRedirectLimit(url, options, signal, maxRedirects) {
   let target = validateHttpUrl(url);
   let requestOptions = { ...options, redirect: 'manual', signal };
@@ -32,7 +26,10 @@ async function fetchWithRedirectLimit(url, options, signal, maxRedirects) {
     const next = validateHttpUrl(new URL(location, target));
     const nextOptions = { ...requestOptions };
     if (next.origin !== target.origin) {
-      nextOptions.headers = withoutSensitiveCrossOriginHeaders(nextOptions.headers);
+      // Credentials may live in custom headers or the body, so a different
+      // origin requires a separately configured request.
+      await response.body?.cancel().catch(() => {});
+      throw new Error('Cross-origin redirect blocked; configure the final trusted check-in URL');
     }
     const method = String(nextOptions.method || 'GET').toUpperCase();
     if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
