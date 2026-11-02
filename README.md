@@ -1,113 +1,138 @@
 # SiteHub
 
-SiteHub 是面向 Windows 本机单用户的网站资产与自动化中心，用目录和标签管理网站，并统一承载收藏、商品监控、多账号签到、任务历史、收件箱和 Webhook 通知。
+**把网站收藏、商品监控和多账号签到集中到一个本地工作台。**
 
-当前版本固定监听 `http://127.0.0.1:8686`。Vue 页面和 `/api/v1` 均由 FastAPI 提供，生产运行不需要 Vite 端口。
+SiteHub 是面向 Windows 本机单用户的网站管理与自动化工具：通过目录和标签整理网站，查看商品价格与库存变化，安排签到，并在统一界面追踪任务、处理消息和维护数据。
 
-## 先说明“一个端口、一个进程”
+技术栈：**Vue 3 · TypeScript · FastAPI · SQLite · Node.js · Playwright**。
 
-正式运行唯一长期业务监听是 FastAPI 的 `127.0.0.1:8686`，Node 签到 Worker 本身不监听端口。但这不是只有一个操作系统进程：FastAPI 会监管无端口的 Node Worker，签到或登录时还可能出现 Chrome、Playwright、OCR 子进程。少数保留 CDP 的专用适配器运行期间，Chrome 会临时监听一个仅限 `127.0.0.1` 的随机调试端口；它不是 SiteHub 的业务入口，任务结束时会随 Chrome 一并清理。停止 SiteHub 时，监管器负责清理这些子进程。
+[快速启动](#快速启动) · [架构设计](docs/architecture.md) · [测试与验收](docs/testing.md) · [运行与维护](docs/operations.md)
 
-SQLite 的业务写入只由 Python 控制面完成；Node Worker 通过标准输入/输出 JSON-RPC 执行浏览器任务，不直接访问业务数据库。
+## 能做什么
 
-## 启动
+| 功能 | 使用方式 |
+| --- | --- |
+| 网站整理 | 目录树、主类型、多标签、书签导入，以及置顶、常用和最近访问 |
+| 商品监控 | 跨站商品列表、站内分类、价格历史、降价阈值、库存变化确认与异常目录保护 |
+| 多账号签到 | API、Cookie、通用浏览器与专用站点适配器；独立账号 Profile、登录验证和签到计划 |
+| 自动化管理 | 查看任务与运行记录，追踪进度、取消或重试任务，处理执行结果不确定的情况 |
+| 消息通知 | 站内收件箱与多个 Webhook 通道，按事件类型和级别筛选，失败后有限重试 |
+| 数据维护 | 一致性备份、完整性校验、下次启动恢复、定时备份与可选历史保留策略 |
 
-环境要求：Windows、Python 3.11–3.13、Node.js 20.19+ 或 22.12+。首次准备依赖需要网络连接。
+商品抓取与签到需要配置对应适配器和账号，不支持任意网站自动适配。
 
-```bat
-start.bat
-```
+## 界面预览
 
-启动脚本会按需创建 `.venv`、从 `requirements.lock` 安装已锁定的 Python 生产依赖、安装 Node 依赖及 Playwright Chromium、构建 `frontend/dist`，随后启动 SiteHub，并在完整就绪后打开浏览器。再次启动同一数据目录会被单实例锁拒绝。直接依赖输入与生产/开发锁的维护规则，以及隔离数据的一键 Windows 验收命令，见 [测试说明](docs/testing.md)。
+以下截图来自本机隔离实例，使用虚构网站、商品和价格历史，不包含真实账号或日常业务数据。
 
-日常数据默认位于 `data/`：
+![SiteHub 总览：网站、商品、签到计划与快捷访问](docs/images/overview.png)
 
-- `data/site-hub.db`：SQLite 数据库；
-- `data/browser-profiles/`：按账号保存的浏览器 Profile；
-- `data/artifacts/`：受控截图等任务产物；
-- `data/backups/`：由页面创建并校验的 SQLite 一致性备份；
-- `data/logs/`：运行日志。
+<details>
+<summary>查看网站管理、商品列表与价格历史</summary>
 
-这些目录可能包含敏感信息，不应提交到 Git 或随意复制。Webhook 端点和 URL 查询参数等秘密由 Windows DPAPI CurrentUser 加密，只能由同一 Windows 用户解密。
+![网站目录与类型筛选](docs/images/sites.png)
 
-可选的登录启动任务不会自动安装。完成验收后才可运行 `tools\install-startup.ps1`。停止服务先运行 `tools\stop-sitehub.ps1`，确认停止后再用 `tools\uninstall-startup.ps1` 移除登录任务；卸载脚本本身不会停止仍在运行的实例。
+![跨站商品列表](docs/images/products.png)
 
-停止前可执行只读审计：
+![商品详情、价格曲线与关注规则](docs/images/product-detail.png)
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\stop-sitehub.ps1 -AuditOnly
-```
+</details>
 
-停止脚本只接受本项目根目录注册的 `SiteHub` 任务，或由本项目 `.venv\Scripts\python.exe -m site_hub.main` 持有的 8686 监听。它会先核验任务 action、Windows 用户、进程路径和命令行；遇到同名外部任务或非本项目端口 owner 时默认不做任何停止操作。`-Force` 只能忽略同名外部任务，不能停止或删除它。
+## 快速启动
 
-## 主要目录
-
-- `site_hub/`：FastAPI、SQLite 数据层、调度、任务队列、通知和 Worker 监管；
-- `worker-node/`：签到/登录适配器与无端口 Node Worker；
-- `frontend/`：Vue 3 + TypeScript 桌面界面；
-- `tools/`：启动辅助、Windows 冒烟测试和旧项目迁移工具；
-- `tests/`：Python 测试；
-- `docs/`：架构、测试和迁移说明。
-
-详细设计见 [架构说明](docs/architecture.md)，验证命令见 [测试说明](docs/testing.md)。
-
-## 网站类型、目录与标签
-
-网站整理采用“一个主类型 + 一个目录 + 多个标签”：主类型用于商城、签到、工具、书签等稳定业务分类，目录保留树状归档位置，标签用于跨目录的多个补充维度。网站列表支持按主类型筛选和批量设置；新建网站、网站详情及“设置 → 网站类型”均可管理这一分类。
-
-系统内置“商城、签到、工具、书签、其他”五种类型。自定义类型可配置名称、稳定标识、颜色、图标、排序和启停；仍被网站引用的类型不能删除，停用类型不能再分配给新网站。旧版 `sites.kind` 会在数据库第 3 版迁移时确定性映射并与正式类型保持同步，因此原有分类不会因升级丢失。
-
-数据库升级到第 3 版后，如需回退到不认识网站类型的旧版 SiteHub，必须同时恢复升级前的第 2 版数据库备份，不能只回退代码。
-
-## 快捷访问与本地使用偏好
-
-总览的“快捷访问”提供“常用”和“最近”两种视图。手动置顶的网站始终优先；其余常用项根据打开次数和最近访问时间的 30 天半衰期自动排序。尚无使用记录时，以置顶和最近添加的网站作为起点。快捷卡片可以打开网站、进入详情、置顶或隐藏；隐藏后可在网站设置中恢复，也可单独清除全部使用记录而保留置顶和隐藏设置。
-
-使用偏好只统计用户通过 SiteHub 的“访问网站”操作。商品链接、签到、商品抓取、详情页浏览和页面刷新不会计入；系统不会读取浏览器历史，也不会保存来源页、IP、User-Agent 或敏感 URL。SQLite 只保留每个网站的聚合次数和最后访问时间，且不会为点击生成活动、收件箱、通知或协议日志。
-
-“从快捷访问隐藏”由数据库第 4 版字段承载。正式库升级前应创建一致性备份；如需回退到第 3 版代码，建议同时恢复升级前的第 3 版数据库备份，避免迁移元数据与旧代码不一致。
-
-## 通知
-
-需要处理的业务事件进入 SiteHub 收件箱。设置页可配置全局事件开关和多个 Webhook 通道；每个通道可筛选事件类型与最低级别。Webhook 端点只在创建或替换时提交，API 和页面只显示“已配置”，不会回显明文。发送由持久化 outbox 执行，支持租约恢复、有限重试和失败事件。
-
-## 商品、分类与调度
-
-商品页支持按网站、分类和库存状态筛选，可打开商品详情查看分页价格历史与按真实时间间隔绘制的价格曲线，并在站点范围内创建、重命名、排序、删除和分配商品分类。商品可跟随抓取分类，也可设置不会被后续同步覆盖的人工分类。
-
-设置页的“调度”页面统一管理签到窗口、商品同步周期、能力启停、当前任务、上次最终结果和错误摘要，并可跳转到站点或账号的覆盖配置。`manual`/`none` 商品能力可保持启用以保留迁移状态，但不会进入自动抓取队列；页面会明确标注“手工目录”或“未配置抓取器”。商品同步并发固定受 Python 控制面限制。
-
-## 本地数据库备份与恢复
-
-设置页的“数据”页面可创建、列出和校验数据库备份。每份备份都使用 SQLite Backup API 生成一致性快照，并记录大小和 SHA-256；显式校验还会执行 SQLite `integrity_check`。
-
-恢复不会热覆盖运行中的数据库。页面需要输入完整备份 ID 才能安排恢复；SiteHub 在下一次启动取得单实例锁后、打开数据库前执行恢复，并先创建当前数据库的 `pre_restore` 回滚备份。恢复标记只会在数据库迁移、任务恢复和通知恢复全部成功后清除；启动验证失败会在仍持有单实例锁时自动装回回滚备份。浏览器 Profile、截图和日志不包含在数据库备份中，仍需保留原数据目录或单独复制。
-
-## 旧项目迁移与切换边界
-
-迁移工具支持 `analyze`、`dry-run` 和 `apply`。建议先执行完整演练：
+环境要求：**64 位 Windows、Python 3.11–3.13、Node.js 20.19+ 或 22.12+**。首次准备依赖需要联网。
 
 ```powershell
-.\.venv\Scripts\python.exe tools\migrate_legacy.py dry-run `
-  --vshop-db C:\path\to\vshop.db `
-  --autocheckin-db C:\path\to\checkin.db `
-  --target-db C:\path\to\site-hub.db
+git clone https://github.com/cquwf53/site-hub.git
+cd site-hub
+.\start.bat
 ```
 
-`dry-run` 会在一次性数据库中完成真实导入、DPAPI、外键和明文检查，然后删除演练目标；不会初始化指定的正式目标。完整参数、Profile 清单与恢复方式见 [迁移说明](docs/legacy-migration.md)。
+启动器会创建 Python 虚拟环境、安装锁定依赖与 Playwright Chromium、构建前端，并在服务完整就绪后打开浏览器。正式运行入口为 **http://127.0.0.1:8686**，由 FastAPI 同时提供页面和 API。
 
-SiteHub 不会自动停止旧服务、注销旧的 `AutoCheckin Hub` 计划任务、注册新开机任务或启用迁入的旧调度。正式 `apply` 和切换必须在计数、外键、密钥、Profile、账号登录、关键界面及 Windows 冒烟测试全部通过后由操作员执行。
+首次使用建议：
 
-切换期间旧项目、旧数据库和旧 Profile 保持只读，至少保留 7 天且不少于两个成功自动运行周期。新系统已经执行过签到后若回滚，旧签到调度应暂停到下一个上海自然日，避免重复签到。
+1. 在“网站”中添加网站，设置目录、类型和标签。
+2. 需要监控商品时，配置对应抓取器与同步周期；手工目录不会自动抓取。
+3. 需要签到时，添加账号并配置适配器；浏览器账号先完成登录和 Profile 验证。
+4. 在“自动化”中查看运行结果，在“收件箱”中处理变化与异常。
+5. 在“设置 → 数据”中创建并校验一份备份。
 
-## 自动备份与保留策略
+默认数据保存在 `data/`，已通过 `.gitignore` 排除。数据库、浏览器 Profile、截图和日志应保留在本地；数据库备份不包含 Profile、截图或日志。停止、登录启动、备份恢复与迁移步骤见[运行与维护](docs/operations.md)。
 
-“设置 → 数据”可设置自动数据库备份间隔（默认开启，每 24 小时一次），查看最近备份、最近完整性校验、下次执行时间与上次维护结果，也可立即执行一次维护。首次启用后从当前时间计算下次执行；计划保存在数据库中，重启后保留，错过的计划在服务恢复后补执行一次。手动维护创建受保护的手动备份。
+## 架构与关键实现
 
-保留策略默认关闭，升级后不会自动删除历史数据。显式开启后，维护先创建并校验数据库备份，再保留最近 N 份自动备份、清理过期日志归档和截图、裁剪过期价格历史。手动备份、恢复前回滚点、最近自动备份始终保留；存在待恢复请求时暂停所有清理。备份数只限制自动备份，手动与回滚快照需要另行管理。
+```mermaid
+flowchart LR
+    Browser[浏览器 / Vue 3] -->|HTTP + SSE| API[FastAPI 控制面]
+    API -->|业务数据与任务| DB[(SQLite / WAL)]
+    API -->|JSON-RPC / stdin + stdout| Worker[Node.js Worker]
+    Worker --> Automation[Playwright / Chrome / OCR]
+    API --> Outbox[持久化通知 outbox]
+    Outbox --> Webhook[Webhook 通道]
+```
 
-截图清理仅处理已结束任务中具有匹配大小和 SHA-256 的过期文件，并遵守单独的保留期限；活动任务、最近改动文件、符号链接与越界路径不会清理。日志只清理轮转或日期归档文件，保留 `startup.log` 等活动日志和任何仍被进程打开的归档。价格历史始终保留每个商品的最新一条观察记录。每次维护最多处理 250 张截图、250 个日志和 5000 条价格历史，剩余项在后续维护中继续处理。
+一个业务端口对应多个受监管进程：Python 负责业务数据与调度，Node Worker 不直接访问业务数据库，也不监听业务端口。部分 Chrome 适配器运行时使用临时回环 CDP 端口。
 
-数据库第 5 版增加商品关注规则及监控状态表。常规启动发现已版本化旧库需要升级，且本次没有执行待恢复请求时，会先创建并校验标注 `Before schema upgrade` 的手动一致性备份，成功后才迁移；该备份不会被自动备份数量策略清理。回退至较早代码时必须同时恢复对应版本的数据库，不能仅回退代码。数据库备份不包含截图、浏览器 Profile 或日志，恢复历史数据库不会恢复已经按保留策略删除的外部文件。
+| 工程问题 | 当前实现 | 代码入口 |
+| --- | --- | --- |
+| 进程中断后的任务处理 | SQLite 持久化队列、租约 Token、心跳与过期恢复；签到按账号和上海业务日期去重 | [任务服务](site_hub/jobs/service.py)、[任务存储](site_hub/services/store_jobs.py) |
+| 浏览器任务影响主服务 | Worker 握手、超时、重启及 Windows 子进程清理；登录、验证、签到共享 Profile 所有权约束 | [Worker 监管](site_hub/workers/supervisor.py)、[Profile 锁](worker-node/src/profile-locks.js) |
+| 远端操作执行后丢失结果 | 使用 `effect_unknown` 保留不确定性；适配器具备核对能力时先核对远端状态 | [执行与核对](worker-node/src/checkin/runner.js) |
+| 抓取抖动引发错误通知 | 降价金额与比例阈值、冷却时间、不同任务的库存确认、商品目录骤降保护 | [监控规则](site_hub/services/product_monitor.py)、[商品同步](site_hub/services/store_products.py) |
+| 业务事件与通知可靠投递 | 事件与 outbox 同事务写入，发送租约、超时和有限重试；不承诺外部接收方恰好收到一次 | [通知存储](site_hub/notifications/store.py)、[通知执行器](site_hub/notifications/executor.py) |
+| 长任务的页面状态同步 | SSE 加任务快照补拉，避免旧请求覆盖新状态；OpenAPI 生成 DTO 并检查漂移 | [前端任务状态](frontend/src/stores/tasks.ts)、[类型生成器](tools/generate-api-types.py) |
+| 升级与恢复的数据保护 | SQLite Backup API、SHA-256 与完整性校验、升级前快照、启动时恢复及失败回滚 | [备份恢复](site_hub/services/backups.py)、[启动生命周期](site_hub/main.py) |
 
-开发时通过 `npm.cmd run api:generate` 从 FastAPI OpenAPI 更新前端 DTO，使用 `npm.cmd run api:check` 检查漂移。统一验收也包含此门槛；生成器不启动服务或初始化业务数据库。
+完整的组件职责、故障语义和数据边界见[架构说明](docs/architecture.md)。
+
+## 开发与验证
+
+项目采用 npm workspaces，前端和 Worker 共用根目录锁文件。
+
+```powershell
+# 完整 Windows 验收：依赖、测试、类型、构建、启动与清理
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify.ps1
+```
+
+完整验收要求 `8686` 空闲。已有服务运行时，请使用[测试说明](docs/testing.md)中的隔离验收流程。
+
+依赖已经安装时，可分别执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q -m "not integration and not profile"
+npm.cmd test
+npm.cmd run typecheck
+npm.cmd run api:check
+```
+
+常规 Python 测试另需 `requirements-dev.lock` 中的开发依赖。真实账号、站点可用性和旧 Profile 迁移需要单独验收；测试通过不代表所有外部站点持续可用。
+
+2026-11-02 本机复验：**232 项 Python、78 项前端、66 项 Worker 测试通过**，前端类型检查及生产构建、OpenAPI DTO 漂移检查、Python 依赖一致性检查通过。隔离 Windows / 浏览器验收也通过，包括 Worker 故障恢复与退出清理。环境与验证边界见[项目检查记录](docs/project-review.md)。
+
+## 项目结构
+
+```text
+site_hub/       FastAPI、SQLite、任务调度、商品监控、通知与 Worker 监管
+frontend/       Vue 3、TypeScript、Pinia、Vue Router 与 Vitest 测试
+worker-node/    JSON-RPC Worker、签到适配器与浏览器资源管理
+tests/          Python 单元与集成测试
+tools/          类型生成、Windows 验收、生命周期管理与旧数据迁移
+docs/           架构、测试、运行维护与迁移文档
+```
+
+## 使用边界与来源
+
+当前生产实现面向 Windows 本机单用户，固定监听回环地址，不提供公网部署或多用户权限管理。敏感配置使用 Windows DPAPI CurrentUser 加密；本机写请求有 Host、Origin 与 CSRF 校验。DPAPI 密文不能直接跨 Windows 用户迁移。
+
+SiteHub 是个人主导、借助 Codex 与 Zcode 进行 AI 辅助开发的项目。开发方式与旧系统整合记录见[开发说明](docs/provenance.md)。仓库目前未提供项目级 LICENSE，第三方依赖遵循各自许可证。
+
+## 文档导航
+
+- [架构设计](docs/architecture.md)：运行拓扑、组件职责、数据边界与故障处理。
+- [测试与验收](docs/testing.md)：Python、前端、Worker 测试及隔离浏览器验收。
+- [运行与维护](docs/operations.md)：启动停止、账号调度、通知、备份恢复与历史保留。
+- [旧数据迁移](docs/legacy-migration.md)：分析、演练、导入与恢复边界。
+- [切换检查](docs/cutover.md)：旧系统切换前后的操作要求。
+- [开发说明](docs/provenance.md)：AI 辅助开发方式、项目演进与依赖授权。
+- [项目检查记录](docs/project-review.md)：本次实测结果、技术阅读入口与后续整理优先级。
