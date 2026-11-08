@@ -16,7 +16,7 @@
 先完成依赖安装、前端构建、迁移演练和 Windows smoke。此阶段旧服务可以继续运行。不要直接用 `start.bat` 做准备，因为它在完成安装后会启动默认正式数据目录；让 smoke 使用隔离临时数据完成同样的依赖准备和构建。
 
 ```powershell
-Set-Location E:\myprojects\site-hub
+Set-Location C:\projects\site-hub
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\smoke-windows.ps1 `
   -StartupTimeoutSeconds 120
 
@@ -30,26 +30,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\smoke-launcher.ps1 `
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\cutover-preflight.ps1 `
-  -SiteHubProject E:\myprojects\site-hub `
+  -SiteHubProject C:\projects\site-hub `
   -VShopProject C:\projects\vshop_monitor `
-  -AutoCheckinProject E:\myprojects\auto-checkin-hub `
-  -TargetData E:\myprojects\site-hub\data `
-  -ReceiptPath E:\myprojects\site-hub\.runtime-state\cutover-receipt.json
+  -AutoCheckinProject C:\projects\auto-checkin-hub `
+  -TargetData C:\projects\site-hub\data `
+  -ReceiptPath C:\projects\site-hub\.runtime-state\cutover-receipt.json
 ```
 
 返回码 `0` 表示没有阻断项；返回码 `2` 表示仍有阻断项。警告需要人工判断，但不会单独令脚本失败。预检显示 Chrome、Node 或 OCR 时，必须先确认 PID 归属，禁止按进程名批量结束其他应用的进程。
 
+迁移脚本的默认来源路径根据当前用户目录和项目相邻目录推导；实际位置不同时，请显式传入 `-VShopProject` 和 `-AutoCheckinProject`。上面的 `C:\projects` 均为示例目录。
+
+本机数据库演练测试支持 `SITEHUB_TEST_VSHOP_DB` 和 `SITEHUB_TEST_AUTOCHECKIN_DB` 环境变量，可指向冻结的审计数据库副本；来源不可用时该测试会跳过。
+
 ## 2. 只读分析与完整演练
 
 ```powershell
-$python = 'E:\myprojects\site-hub\.venv\Scripts\python.exe'
-$migrate = 'E:\myprojects\site-hub\tools\migrate_legacy.py'
+$python = 'C:\projects\site-hub\.venv\Scripts\python.exe'
+$migrate = 'C:\projects\site-hub\tools\migrate_legacy.py'
 $vshopDb = 'C:\projects\vshop_monitor\data\vshop.db'
-$checkinDb = 'E:\myprojects\auto-checkin-hub\data\checkin.db'
-$profiles = 'E:\myprojects\auto-checkin-hub\data\browser-profiles'
-$artifacts = 'E:\myprojects\auto-checkin-hub\data\screenshots'
-$targetDb = 'E:\myprojects\site-hub\data\site-hub.db'
-$receipt = 'E:\myprojects\site-hub\.runtime-state\cutover-receipt.json'
+$checkinDb = 'C:\projects\auto-checkin-hub\data\checkin.db'
+$profiles = 'C:\projects\auto-checkin-hub\data\browser-profiles'
+$artifacts = 'C:\projects\auto-checkin-hub\data\screenshots'
+$targetDb = 'C:\projects\site-hub\data\site-hub.db'
+$receipt = 'C:\projects\site-hub\.runtime-state\cutover-receipt.json'
 
 & $python $migrate analyze `
   --vshop-db $vshopDb --autocheckin-db $checkinDb `
@@ -91,9 +95,9 @@ Get-ScheduledTask -TaskName 'AutoCheckin Hub' | Format-List TaskName,State
   --vshop-db $vshopDb --autocheckin-db $checkinDb --target-db $targetDb `
   --preflight-receipt $receipt `
   --copy-profiles --profile-source $profiles `
-  --profile-target 'E:\myprojects\site-hub\data\browser-profiles' `
+  --profile-target 'C:\projects\site-hub\data\browser-profiles' `
   --copy-artifacts --artifact-source $artifacts `
-  --artifact-target 'E:\myprojects\site-hub\data\artifacts'
+  --artifact-target 'C:\projects\site-hub\data\artifacts'
 ```
 
 迁移器在首次创建目标前验证收据，并在业务导入后再次验证源路径、SHA-256 和 WAL 冻结状态。初始化或业务导入失败时，只删除本次独占创建的目标 DB/WAL/SHM，因此可在收据有效期内安全重试。Profile 或截图复制阶段中断时，成功导入的数据库与收据绑定会保留；确认冻结源与收据哈希仍一致后，Profile 使用 `--copy-profiles --profiles-only`、截图使用 `--copy-artifacts --artifacts-only` 恢复，禁止重复导入业务数据。恢复阶段不再接收短时效收据，而是从目标数据库读取已持久化绑定，并重新核对源库哈希及 Profile 源/目标路径。

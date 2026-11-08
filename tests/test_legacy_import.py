@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1073,10 +1074,16 @@ def test_profile_copier_rejects_reparse_points(
 
 @pytest.mark.integration
 def test_real_frozen_database_backup_rehearsal(tmp_path):
-    vshop_source = Path(
-        r"C:\projects\vshop_monitor\data\vshop.db"
-    )
-    auto_source = Path(r"E:\myprojects\auto-checkin-hub\data\checkin.db")
+    vshop_source = Path(os.environ.get(
+        "SITEHUB_TEST_VSHOP_DB",
+        str(Path.home() / ".gemini" / "antigravity" / "scratch"
+            / "vshop_monitor" / "data" / "vshop.db"),
+    ))
+    auto_source = Path(os.environ.get(
+        "SITEHUB_TEST_AUTOCHECKIN_DB",
+        str(Path(__file__).resolve().parents[2]
+            / "auto-checkin-hub" / "data" / "checkin.db"),
+    ))
     if not vshop_source.is_file() or not auto_source.is_file():
         pytest.skip("audited legacy databases are unavailable")
     vshop_copy, auto_copy = tmp_path / "vshop.copy.db", tmp_path / "auto.copy.db"

@@ -1,7 +1,7 @@
 param(
     [string]$SiteHubProject = '',
-    [string]$VShopProject = 'C:\projects\vshop_monitor',
-    [string]$AutoCheckinProject = 'E:\myprojects\auto-checkin-hub',
+    [string]$VShopProject = (Join-Path $env:USERPROFILE '.gemini\antigravity\scratch\vshop_monitor'),
+    [string]$AutoCheckinProject = (Join-Path $PSScriptRoot '..\..\auto-checkin-hub'),
     [string]$VShopDatabase = '',
     [string]$AutoCheckinDatabase = '',
     [string]$ProfileSource = '',
